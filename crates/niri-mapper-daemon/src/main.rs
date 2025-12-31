@@ -249,6 +249,33 @@ async fn run_event_loop(
                 break;
             }
             // Handle SIGHUP for configuration reload
+            //
+            // ## Configuration Reload Behavior (SIGHUP)
+            //
+            // When SIGHUP is received, the daemon performs a "hot reload" of the
+            // configuration. This updates remapper rules without restarting or
+            // re-grabbing devices.
+            //
+            // ### Can be reloaded (SIGHUP):
+            // - Remap rules (1:1 key remappings)
+            // - Combo rules (multi-key sequences)
+            // - niri-passthrough keybinds
+            // - Profile settings within existing devices (rules are rebuilt from config)
+            //
+            // ### Requires restart:
+            // - Adding new devices to config (daemon only grabs devices at startup)
+            // - Removing devices from config (already-grabbed devices keep running)
+            // - Changing device names (matching is done at startup)
+            // - Adding new profiles (device structure changes require restart)
+            // - Changing which profile is active (future: profile switching will
+            //   allow dynamic profile changes)
+            //
+            // ### Error handling:
+            // If configuration parsing fails, the daemon logs the error and
+            // continues running with the previous (working) configuration.
+            // This ensures a typo in the config file doesn't crash the daemon.
+            // The user should fix the config and send SIGHUP again.
+            //
             _ = sighup.recv() => {
                 tracing::info!("SIGHUP received, reloading configuration...");
 
@@ -258,13 +285,91 @@ async fn run_event_loop(
                             "Configuration reloaded successfully with {} device(s)",
                             new_config.devices.len()
                         );
-                        // TODO: Implement remapper hot-swap in task 020-5.6
-                        // TODO: Regenerate niri keybinds in task 020-5.5
-                        // For now, config is loaded and validated but not applied to remappers
+
+                        // Hot-swap remappers for existing grabbed devices
+                        let mut updated_count = 0;
+                        let mut not_found_count = 0;
+
+                        for (idx, device_info) in device_infos.iter().enumerate() {
+                            // Find the matching device config in the new config by name
+                            let matching_device_config = new_config.devices.iter().find(|dc| {
+                                dc.name.as_ref() == Some(&device_info.name)
+                            });
+
+                            match matching_device_config {
+                                Some(device_config) => {
+                                    // Get the default profile from the new config
+                                    match device_config.profiles.get("default") {
+                                        Some(default_profile) => {
+                                            // Create a new remapper and replace the old one
+                                            let new_remapper = Remapper::from_profile(default_profile);
+                                            remappers[idx] = new_remapper;
+                                            tracing::info!(
+                                                "Updated remapper for device '{}' with new configuration",
+                                                device_info.name
+                                            );
+                                            updated_count += 1;
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "Device '{}' in new config has no 'default' profile, keeping old remapper",
+                                                device_info.name
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "Device '{}' not found in new config, keeping old remapper",
+                                        device_info.name
+                                    );
+                                    not_found_count += 1;
+                                }
+                            }
+                        }
+
+                        tracing::info!(
+                            "Remapper hot-swap complete: {} updated, {} kept (not in new config)",
+                            updated_count,
+                            not_found_count
+                        );
+
+                        // Regenerate niri keybinds after successful config reload
+                        match niri_mapper_config::write_niri_keybinds(&new_config, &config_path) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "Regenerated niri keybinds at {}",
+                                    new_config.global.niri_keybinds_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to regenerate niri keybinds: {}",
+                                    e
+                                );
+                                // Continue running - keybind generation failure shouldn't
+                                // stop the daemon, but the user should be aware
+                            }
+                        }
                     }
                     Err(e) => {
-                        // TODO: Improve error handling in task 020-5.4
+                        // Log the error with full details
                         tracing::error!("Failed to reload configuration: {}", e);
+
+                        // Log the full error chain for debugging
+                        // Using Debug format to capture all error context
+                        tracing::debug!("Configuration reload error details: {:?}", e);
+
+                        // Log the error chain (anyhow captures the full cause chain)
+                        for (i, cause) in e.chain().skip(1).enumerate() {
+                            tracing::error!("  Caused by [{}]: {}", i + 1, cause);
+                        }
+
+                        // Explicitly inform that the old configuration remains active
+                        tracing::warn!(
+                            "Configuration reload failed - continuing with previous configuration. \
+                             Fix the configuration file and send SIGHUP again to retry."
+                        );
                     }
                 }
             }
@@ -318,11 +423,8 @@ async fn main() -> Result<()> {
     let config = load_config(&config_path)?;
 
     // Generate niri keybinds
-    niri_mapper_config::generate_niri_keybinds(&config);
-    tracing::info!(
-        "Generated niri keybinds at {}",
-        config.global.niri_keybinds_path.display()
-    );
+    niri_mapper_config::write_niri_keybinds(&config, &config_path)
+        .context("Failed to generate niri keybinds")?;
 
     // Grab all configured devices
     let grabbed_devices = grab_configured_devices(&config)?;

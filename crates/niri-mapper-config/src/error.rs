@@ -56,6 +56,17 @@ pub struct InvalidKeyInfo {
     pub location: SourceLocation,
 }
 
+/// Information about a duplicate keybind conflict
+#[derive(Debug, Clone)]
+pub struct DuplicateKeybindInfo {
+    /// The key combination that is duplicated (e.g., "Super+Return")
+    pub key: String,
+    /// Device name where this keybind was found
+    pub device: String,
+    /// Profile name where this keybind was found
+    pub profile: String,
+}
+
 /// Position of a key in a remap definition
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPosition {
@@ -99,6 +110,12 @@ pub enum ConfigError {
         invalid_keys: Vec<InvalidKeyInfo>,
     },
 
+    #[error("{}", format_duplicate_keybinds_message(.duplicates))]
+    DuplicateKeybinds {
+        /// All duplicate keybind conflicts found
+        duplicates: Vec<DuplicateKeybindInfo>,
+    },
+
     #[error("Failed to read configuration file")]
     Io(#[from] std::io::Error),
 }
@@ -111,6 +128,7 @@ impl Diagnostic for ConfigError {
             ConfigError::MissingField { .. } => "niri_mapper::config::missing_field",
             ConfigError::UnknownKey { .. } => "niri_mapper::config::unknown_key",
             ConfigError::InvalidKeys { .. } => "niri_mapper::config::invalid_keys",
+            ConfigError::DuplicateKeybinds { .. } => "niri_mapper::config::duplicate_keybinds",
             ConfigError::Io(_) => "niri_mapper::config::io_error",
         };
         Some(Box::new(code))
@@ -149,6 +167,9 @@ impl Diagnostic for ConfigError {
                     help.push_str(&format!("\nCheck the spelling of '{}' in your {} block.", key.key, key.context));
                 }
                 Some(help)
+            }
+            ConfigError::DuplicateKeybinds { .. } => {
+                Some("Each keybind can only be defined once across all devices and profiles. Remove or rename the duplicate keybinds.".to_string())
             }
             ConfigError::Io(e) => {
                 match e.kind() {
@@ -220,4 +241,32 @@ fn format_invalid_keys_message(keys: &[InvalidKeyInfo]) -> String {
     }
 
     format!("Found {} invalid key(s) in configuration", keys.len())
+}
+
+/// Format the list of duplicate keybinds for the error message
+fn format_duplicate_keybinds_message(duplicates: &[DuplicateKeybindInfo]) -> String {
+    use std::collections::HashMap;
+
+    if duplicates.is_empty() {
+        return "No duplicate keybinds".to_string();
+    }
+
+    // Group duplicates by key
+    let mut by_key: HashMap<&str, Vec<&DuplicateKeybindInfo>> = HashMap::new();
+    for dup in duplicates {
+        by_key.entry(&dup.key).or_default().push(dup);
+    }
+
+    // Build message listing each duplicate key and its sources
+    let mut lines = vec!["Duplicate keybinds detected:".to_string()];
+
+    for (key, sources) in &by_key {
+        let source_list: Vec<String> = sources
+            .iter()
+            .map(|s| format!("{}:{}", s.device, s.profile))
+            .collect();
+        lines.push(format!("  '{}' defined in: {}", key, source_list.join(", ")));
+    }
+
+    lines.join("\n")
 }

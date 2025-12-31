@@ -47,7 +47,25 @@ enum Commands {
 
     /// Stop the daemon via systemctl
     Stop,
-    // TODO: v0.2.0 - reload via SIGHUP
+
+    /// Reload daemon configuration (sends SIGHUP)
+    ///
+    /// Triggers the daemon to re-read and apply configuration changes.
+    ///
+    /// ## Can be reloaded (SIGHUP):
+    /// - Remap rules (1:1 key remappings)
+    /// - Combo rules (multi-key sequences)
+    /// - niri-passthrough keybinds
+    /// - Profile settings within existing devices
+    ///
+    /// ## Requires restart (stop + start):
+    /// - Adding/removing devices from config
+    /// - Changing device names
+    /// - Adding new profiles (device structure changes)
+    ///
+    /// If configuration parsing fails, the daemon keeps running with the
+    /// previous configuration. Fix the config and reload again.
+    Reload,
 }
 
 fn main() -> miette::Result<()> {
@@ -71,6 +89,7 @@ fn main() -> miette::Result<()> {
         Commands::Status => cmd_status(),
         Commands::Start => cmd_start(),
         Commands::Stop => cmd_stop(),
+        Commands::Reload => cmd_reload(),
     }
 }
 
@@ -307,7 +326,7 @@ fn cmd_generate(config_path: &PathBuf, output: Option<PathBuf>) -> miette::Resul
         config.global.niri_keybinds_path = output_path;
     }
 
-    let content = niri_mapper_config::generate_niri_keybinds(&config);
+    let content = niri_mapper_config::generate_niri_keybinds(&config, config_path);
 
     // Ensure parent directory exists
     if let Some(parent) = config.global.niri_keybinds_path.parent() {
@@ -482,6 +501,83 @@ fn cmd_stop() -> miette::Result<()> {
         println!("\nCheck logs with:");
         println!("  journalctl --user -u niri-mapper -e");
     }
+
+    Ok(())
+}
+
+/// Send SIGHUP to the daemon to trigger a configuration reload.
+///
+/// This sends a reload signal via systemctl, which causes the daemon to:
+/// 1. Re-parse the configuration file
+/// 2. Rebuild remappers for all currently grabbed devices
+/// 3. Regenerate the niri keybinds file
+///
+/// The daemon keeps the old configuration if parsing fails, so this is safe
+/// to run even with a potentially broken config - just fix and reload again.
+///
+/// Note: This only reloads rules and settings. Device changes (adding/removing
+/// devices, changing names) require a full restart via `stop` + `start`.
+fn cmd_reload() -> miette::Result<()> {
+    use std::process::Command;
+
+    // Try user service first
+    let user_output = Command::new("systemctl")
+        .args(["--user", "reload", "niri-mapper"])
+        .output()
+        .into_diagnostic()?;
+
+    let user_stderr = String::from_utf8_lossy(&user_output.stderr);
+
+    // Check if user service exists and reload succeeded
+    if user_output.status.success() {
+        println!("Reload signal sent to niri-mapper daemon.");
+        return Ok(());
+    }
+
+    // Check if user service is not found - try system service
+    if user_stderr.contains("could not be found")
+        || user_stderr.contains("Unit niri-mapper.service could not be found")
+    {
+        // Try system service
+        let sys_output = Command::new("systemctl")
+            .args(["reload", "niri-mapper"])
+            .output()
+            .into_diagnostic()?;
+
+        let sys_stderr = String::from_utf8_lossy(&sys_output.stderr);
+
+        if sys_output.status.success() {
+            println!("Reload signal sent to niri-mapper daemon.");
+            return Ok(());
+        }
+
+        // Check if system service is also not found
+        if sys_stderr.contains("could not be found")
+            || sys_stderr.contains("Unit niri-mapper.service could not be found")
+        {
+            println!("Error: niri-mapper service is not installed.");
+            println!("\nTo install, run:");
+            println!("  niri-mapper install");
+            return Ok(());
+        }
+
+        // System service exists but reload failed
+        println!("Failed to reload niri-mapper service.");
+        if !sys_stderr.is_empty() {
+            println!("Error: {}", sys_stderr.trim());
+        }
+        println!("\nCheck logs with:");
+        println!("  journalctl -u niri-mapper -e");
+        return Ok(());
+    }
+
+    // User service exists but reload failed (maybe not running)
+    println!("Failed to reload niri-mapper service.");
+    if !user_stderr.is_empty() {
+        println!("Error: {}", user_stderr.trim());
+    }
+    println!("\nIs the service running? Check with:");
+    println!("  niri-mapper status");
 
     Ok(())
 }

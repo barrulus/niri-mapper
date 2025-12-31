@@ -11,4 +11,4 @@ mod generator;
 pub use error::ConfigError;
 pub use model::*;
 pub use parser::parse_config;
-pub use generator::generate_niri_keybinds;
+pub use generator::{generate_niri_keybinds, write_niri_keybinds};

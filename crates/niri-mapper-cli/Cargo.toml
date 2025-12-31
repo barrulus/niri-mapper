@@ -1,0 +1,22 @@
+[package]
+name = "niri-mapper-cli"
+description = "CLI tool for niri-mapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "niri-mapper"
+path = "src/main.rs"
+
+[dependencies]
+niri-mapper-config.workspace = true
+
+clap.workspace = true
+anyhow.workspace = true
+evdev.workspace = true
+shellexpand.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+miette = { workspace = true, features = ["fancy"] }

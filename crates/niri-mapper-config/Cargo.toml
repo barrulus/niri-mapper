@@ -1,0 +1,15 @@
+[package]
+name = "niri-mapper-config"
+description = "Configuration parsing for niri-mapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kdl.workspace = true
+miette.workspace = true
+serde.workspace = true
+shellexpand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

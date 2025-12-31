@@ -215,7 +215,7 @@ niri-mapper/
 ```nix
 # flake.nix
 {
-  inputs.niri-mapper.url = "github:user/niri-mapper";
+  inputs.niri-mapper.url = "github:barrulus/niri-mapper";
 }
 
 # configuration.nix

@@ -1,0 +1,24 @@
+[package]
+name = "niri-mapper-daemon"
+description = "Input remapping daemon for niri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "niri-mapperd"
+path = "src/main.rs"
+
+[dependencies]
+niri-mapper-config.workspace = true
+
+tokio.workspace = true
+evdev.workspace = true
+nix.workspace = true
+shellexpand.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

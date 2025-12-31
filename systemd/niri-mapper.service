@@ -1,0 +1,19 @@
+[Unit]
+Description=niri-mapper input remapping daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/niri-mapperd --config %h/.config/niri-mapper/config.kdl --foreground
+Restart=on-failure
+RestartSec=5
+
+# Security (limited - needs access to input devices)
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=graphical-session.target

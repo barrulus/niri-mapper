@@ -1,3 +1,25 @@
+# Environment
 .env
+.claude/
+
+# Reference implementation
 nix-hid-remap/
 
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Nix
+result
+result-*
+.direnv/
+
+# OS
+.DS_Store
+Thumbs.db

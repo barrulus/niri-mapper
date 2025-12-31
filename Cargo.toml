@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/niri-mapper-daemon",
+    "crates/niri-mapper-cli",
+    "crates/niri-mapper-config",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/barrulus/niri-mapper"
+authors = ["barrulus"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Input handling
+evdev = "0.12"
+# uinput handled via nix crate for now
+
+# Configuration
+kdl = "4"
+miette = { version = "7", features = ["fancy"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Path expansion
+shellexpand = "3"
+
+# Unix/Linux specific
+nix = { version = "0.29", features = ["ioctl", "fs"] }
+
+# IPC
+serde_json = "1"
+
+# Internal crates
+niri-mapper-config = { path = "crates/niri-mapper-config" }

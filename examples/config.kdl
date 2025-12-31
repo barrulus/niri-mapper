@@ -1,0 +1,73 @@
+// niri-mapper example configuration
+// Copy to ~/.config/niri-mapper/config.kdl
+
+global {
+    log-level "info"
+    niri-keybinds-path "~/.config/niri/niri-mapper-keybinds.kdl"
+}
+
+// Example: Keychron K3 Pro keyboard
+device "Keychron K3 Pro" {
+    profile "default" {
+        // Swap CapsLock and Escape
+        remap {
+            CapsLock "Escape"
+            Escape "CapsLock"
+        }
+
+        // Key combinations
+        combo {
+            // Example: Ctrl+Shift+Q -> Alt+F4
+            Ctrl+Shift+Q "Alt+F4"
+        }
+
+        // Macros (key sequences with optional delays)
+        macro {
+            // Example: Ctrl+Shift+D -> copy, wait 50ms, paste
+            Ctrl+Shift+D "Ctrl+c" "delay(50)" "Ctrl+v"
+        }
+
+        // Passthrough keys to niri (single source of truth)
+        // These bindings will be generated to the niri keybinds file
+        niri-passthrough {
+            Super+Return { spawn "alacritty"; }
+            Super+d { spawn "fuzzel"; }
+            Super+q { close-window; }
+            Super+m { maximize; }
+            Super+f { fullscreen; }
+
+            // Workspace navigation
+            Super+1 { focus-workspace 1; }
+            Super+2 { focus-workspace 2; }
+            Super+3 { focus-workspace 3; }
+            Super+4 { focus-workspace 4; }
+
+            // Move window to workspace
+            Super+Shift+1 { move-window-to-workspace 1; }
+            Super+Shift+2 { move-window-to-workspace 2; }
+            Super+Shift+3 { move-window-to-workspace 3; }
+            Super+Shift+4 { move-window-to-workspace 4; }
+
+            // Focus navigation
+            Super+h { focus-column-left; }
+            Super+j { focus-window-down; }
+            Super+k { focus-window-up; }
+            Super+l { focus-column-right; }
+
+            // Screenshot
+            Print { screenshot; }
+            Super+Print { screenshot-window; }
+        }
+    }
+}
+
+// Example: Logitech mouse with extra buttons
+device "Logitech G Pro" {
+    profile "default" {
+        remap {
+            // Map side buttons to browser navigation
+            XF86Back "Alt+Left"
+            XF86Forward "Alt+Right"
+        }
+    }
+}

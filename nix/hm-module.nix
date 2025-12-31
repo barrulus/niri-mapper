@@ -5,8 +5,124 @@ self:
 let
   cfg = config.services.niri-mapper;
 
+  # Type definitions for niri-mapper configuration (mirrored from NixOS module)
+
+  # Global settings submodule
+  globalType = lib.types.submodule {
+    options = {
+      logLevel = lib.mkOption {
+        type = lib.types.enum [ "trace" "debug" "info" "warn" "error" ];
+        default = "info";
+        description = "Log level for the niri-mapper daemon";
+      };
+
+      niriKeybindsPath = lib.mkOption {
+        type = lib.types.str;
+        default = "${config.xdg.configHome}/niri/niri-mapper-keybinds.kdl";
+        description = "Path to write generated niri keybinds file";
+      };
+    };
+  };
+
+  # Niri passthrough binding submodule
+  passthroughType = lib.types.submodule {
+    options = {
+      key = lib.mkOption {
+        type = lib.types.str;
+        description = "Key combination (e.g., 'Super+Return')";
+        example = "Super+Return";
+      };
+
+      action = lib.mkOption {
+        type = lib.types.str;
+        description = "Niri action to execute (e.g., 'spawn \"alacritty\";')";
+        example = ''spawn "alacritty";'';
+      };
+    };
+  };
+
+  # Profile submodule
+  profileType = lib.types.submodule {
+    options = {
+      remap = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = {};
+        description = "Key remappings (from -> to)";
+        example = lib.literalExpression ''
+          {
+            CapsLock = "Escape";
+            Escape = "CapsLock";
+          }
+        '';
+      };
+
+      niriPassthrough = lib.mkOption {
+        type = lib.types.listOf passthroughType;
+        default = [];
+        description = "Keybinds to pass through to niri";
+        example = lib.literalExpression ''
+          [
+            { key = "Super+Return"; action = "spawn \"alacritty\";"; }
+          ]
+        '';
+      };
+
+      combo = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = {};
+        description = "Key combination remappings (e.g., Ctrl+Shift+Q -> Alt+F4)";
+        example = lib.literalExpression ''
+          {
+            "Ctrl+Shift+Q" = "Alt+F4";
+          }
+        '';
+      };
+    };
+  };
+
+  # Device submodule
+  deviceType = lib.types.submodule {
+    options = {
+      name = lib.mkOption {
+        type = lib.types.str;
+        description = "Device name to match (exact match)";
+        example = "Keychron K3 Pro";
+      };
+
+      profiles = lib.mkOption {
+        type = lib.types.attrsOf profileType;
+        default = { default = {}; };
+        description = "Named profiles for this device";
+        example = lib.literalExpression ''
+          {
+            default = {
+              remap = { CapsLock = "Escape"; };
+            };
+          }
+        '';
+      };
+    };
+  };
+
+  # Settings submodule (top-level)
+  settingsType = lib.types.submodule {
+    options = {
+      global = lib.mkOption {
+        type = globalType;
+        default = {};
+        description = "Global settings for niri-mapper";
+      };
+
+      devices = lib.mkOption {
+        type = lib.types.listOf deviceType;
+        default = [];
+        description = "List of devices to configure";
+      };
+    };
+  };
+
   # Convert Nix attrset to KDL configuration
-  configToKdl = config: let
+  configToKdl = settings: let
     indent = level: lib.concatStrings (lib.genList (_: "    ") level);
 
     globalToKdl = global: ''
@@ -62,13 +178,15 @@ in
     };
 
     settings = lib.mkOption {
-      type = lib.types.attrs;
+      type = settingsType;
       default = {};
       description = "niri-mapper configuration (will be converted to KDL)";
       example = lib.literalExpression ''
         {
           global = {
             logLevel = "info";
+            # Uses XDG config home by default
+            # niriKeybindsPath = "~/.config/niri/niri-mapper-keybinds.kdl";
           };
           devices = [
             {
@@ -76,10 +194,15 @@ in
               profiles.default = {
                 remap = {
                   CapsLock = "Escape";
+                  Escape = "CapsLock";
                 };
                 niriPassthrough = [
                   { key = "Super+Return"; action = "spawn \"alacritty\";"; }
+                  { key = "Super+d"; action = "spawn \"fuzzel\";"; }
                 ];
+                combo = {
+                  "Ctrl+Shift+Q" = "Alt+F4";
+                };
               };
             }
           ];

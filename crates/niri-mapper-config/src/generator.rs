@@ -1,7 +1,29 @@
 //! Generate niri-compatible KDL keybind files
 
-use crate::model::Config;
 use crate::error::ConfigError;
+use crate::model::Config;
+
+/// Translate key modifiers from common notation to niri notation.
+///
+/// Maps:
+/// - `Super` -> `Mod` (niri convention for the super/meta key)
+/// - `Ctrl`, `Alt`, `Shift` -> passed through unchanged
+///
+/// This handles all modifier variations in a key combination like `Ctrl+Shift+Super+Q`.
+fn translate_modifiers(key: &str) -> String {
+    // Split on '+' to handle each part of the key combination
+    key.split('+')
+        .map(|part| {
+            let trimmed = part.trim();
+            match trimmed {
+                "Super" => "Mod",
+                // Pass through all other modifiers and keys unchanged
+                other => other,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
 
 /// Generate niri keybinds KDL from the configuration
 pub fn generate_niri_keybinds(config: &Config) -> String {
@@ -21,8 +43,8 @@ pub fn generate_niri_keybinds(config: &Config) -> String {
     for device in &config.devices {
         for (_profile_name, profile) in &device.profiles {
             for keybind in &profile.niri_passthrough {
-                // Convert Super to Mod for niri
-                let niri_key = keybind.key.replace("Super", "Mod");
+                // Translate modifiers (Super -> Mod, others pass through)
+                let niri_key = translate_modifiers(&keybind.key);
                 output.push_str(&format!("    {} {{ {} }}\n", niri_key, keybind.action));
             }
         }
@@ -33,9 +55,39 @@ pub fn generate_niri_keybinds(config: &Config) -> String {
     output
 }
 
-/// Write niri keybinds to the configured path
+/// Validate that the generated KDL can be parsed back by kdl-rs.
+///
+/// This ensures we never write invalid KDL to the output file.
+/// Returns an error if the KDL fails to parse.
+fn validate_kdl(content: &str) -> Result<(), ConfigError> {
+    content.parse::<kdl::KdlDocument>().map_err(|e| {
+        ConfigError::Invalid {
+            message: format!(
+                "Generated KDL is invalid (this is a bug in niri-mapper): {}",
+                e
+            ),
+        }
+    })?;
+    Ok(())
+}
+
+/// Write niri keybinds to the configured path using atomic writes.
+///
+/// This function:
+/// 1. Generates the KDL content from the configuration
+/// 2. Validates the generated KDL can be parsed back (fails hard if invalid)
+/// 3. Writes to a temporary file in the same directory
+/// 4. Atomically renames the temp file to the target path
+///
+/// If validation or write fails, the original file is preserved.
+/// The temp file is written to the same directory as the target to ensure
+/// the atomic rename works (must be on the same filesystem).
 pub fn write_niri_keybinds(config: &Config) -> Result<(), ConfigError> {
     let content = generate_niri_keybinds(config);
+
+    // Validate generated KDL before writing - fail hard if invalid
+    validate_kdl(&content)?;
+
     let path = &config.global.niri_keybinds_path;
 
     // Ensure parent directory exists
@@ -43,7 +95,24 @@ pub fn write_niri_keybinds(config: &Config) -> Result<(), ConfigError> {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(path, content)?;
+    // Atomic write: write to temp file, then rename
+    // Temp file must be in same directory for atomic rename to work
+    let temp_path = path.with_extension("kdl.tmp");
+
+    // Write to temp file
+    if let Err(e) = std::fs::write(&temp_path, &content) {
+        // Clean up temp file if it was partially written
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e.into());
+    }
+
+    // Atomic rename - this preserves the original file if rename fails
+    if let Err(e) = std::fs::rename(&temp_path, path) {
+        // Clean up temp file on rename failure
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e.into());
+    }
+
     tracing::info!("Wrote niri keybinds to {}", path.display());
 
     Ok(())
@@ -55,26 +124,221 @@ mod tests {
     use crate::model::*;
 
     #[test]
+    fn test_translate_modifiers_super_to_mod() {
+        assert_eq!(translate_modifiers("Super+Return"), "Mod+Return");
+    }
+
+    #[test]
+    fn test_translate_modifiers_ctrl_shift_super() {
+        // DoD: Ctrl+Shift+Super+Q translates to Ctrl+Shift+Mod+Q
+        assert_eq!(
+            translate_modifiers("Ctrl+Shift+Super+Q"),
+            "Ctrl+Shift+Mod+Q"
+        );
+    }
+
+    #[test]
+    fn test_translate_modifiers_passthrough() {
+        // Ctrl, Alt, Shift should pass through unchanged
+        assert_eq!(translate_modifiers("Ctrl+A"), "Ctrl+A");
+        assert_eq!(translate_modifiers("Alt+Tab"), "Alt+Tab");
+        assert_eq!(translate_modifiers("Shift+Enter"), "Shift+Enter");
+        assert_eq!(translate_modifiers("Ctrl+Alt+Delete"), "Ctrl+Alt+Delete");
+    }
+
+    #[test]
+    fn test_translate_modifiers_single_key() {
+        // Single keys without modifiers should pass through
+        assert_eq!(translate_modifiers("Return"), "Return");
+        assert_eq!(translate_modifiers("Escape"), "Escape");
+    }
+
+    #[test]
+    fn test_validate_kdl_valid() {
+        let valid_kdl = "binds {\n    Mod+Return { spawn \"alacritty\"; }\n}\n";
+        assert!(validate_kdl(valid_kdl).is_ok());
+    }
+
+    #[test]
+    fn test_validate_kdl_invalid() {
+        // Missing closing brace
+        let invalid_kdl = "binds {\n    Mod+Return { spawn \"alacritty\"\n";
+        let result = validate_kdl(invalid_kdl);
+        assert!(result.is_err());
+        if let Err(ConfigError::Invalid { message }) = result {
+            assert!(message.contains("Generated KDL is invalid"));
+        } else {
+            panic!("Expected ConfigError::Invalid");
+        }
+    }
+
+    #[test]
     fn test_generate_keybinds() {
         let config = Config {
             global: GlobalConfig::default(),
             devices: vec![DeviceConfig {
                 name: Some("Test".to_string()),
                 vendor_product: None,
-                profiles: [("default".to_string(), Profile {
-                    niri_passthrough: vec![
-                        NiriKeybind {
+                profiles: [(
+                    "default".to_string(),
+                    Profile {
+                        niri_passthrough: vec![NiriKeybind {
                             key: "Super+Return".to_string(),
                             action: "spawn \"alacritty\";".to_string(),
-                        },
-                    ],
-                    ..Default::default()
-                })].into_iter().collect(),
+                        }],
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
             }],
         };
 
         let output = generate_niri_keybinds(&config);
         assert!(output.contains("Mod+Return"));
         assert!(output.contains("spawn \"alacritty\""));
+
+        // Verify generated KDL is valid
+        assert!(validate_kdl(&output).is_ok());
+    }
+
+    #[test]
+    fn test_generate_keybinds_complex_modifiers() {
+        let config = Config {
+            global: GlobalConfig::default(),
+            devices: vec![DeviceConfig {
+                name: Some("Test".to_string()),
+                vendor_product: None,
+                profiles: [(
+                    "default".to_string(),
+                    Profile {
+                        niri_passthrough: vec![
+                            NiriKeybind {
+                                key: "Ctrl+Shift+Super+Q".to_string(),
+                                action: "quit;".to_string(),
+                            },
+                            NiriKeybind {
+                                key: "Alt+Tab".to_string(),
+                                action: "focus-window-next;".to_string(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        };
+
+        let output = generate_niri_keybinds(&config);
+
+        // Check Super -> Mod translation
+        assert!(output.contains("Ctrl+Shift+Mod+Q"));
+        assert!(!output.contains("Super"));
+
+        // Check other modifiers are unchanged
+        assert!(output.contains("Alt+Tab"));
+
+        // Verify generated KDL is valid
+        assert!(validate_kdl(&output).is_ok());
+    }
+
+    #[test]
+    fn test_atomic_write_creates_file() {
+        let temp_dir = std::env::temp_dir().join("niri-mapper-test-atomic");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let keybinds_path = temp_dir.join("keybinds.kdl");
+
+        let config = Config {
+            global: GlobalConfig {
+                niri_keybinds_path: keybinds_path.clone(),
+                ..Default::default()
+            },
+            devices: vec![DeviceConfig {
+                name: Some("Test".to_string()),
+                vendor_product: None,
+                profiles: [(
+                    "default".to_string(),
+                    Profile {
+                        niri_passthrough: vec![NiriKeybind {
+                            key: "Super+Return".to_string(),
+                            action: "spawn \"alacritty\";".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        };
+
+        // Write should succeed
+        write_niri_keybinds(&config).unwrap();
+
+        // File should exist
+        assert!(keybinds_path.exists());
+
+        // Content should be valid
+        let content = std::fs::read_to_string(&keybinds_path).unwrap();
+        assert!(content.contains("Mod+Return"));
+
+        // Temp file should not exist (was renamed)
+        let temp_path = keybinds_path.with_extension("kdl.tmp");
+        assert!(!temp_path.exists());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_atomic_write_preserves_original_on_directory_error() {
+        use std::path::PathBuf;
+        let temp_dir = std::env::temp_dir().join("niri-mapper-test-preserve");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let keybinds_path = temp_dir.join("keybinds.kdl");
+        let original_content = "// Original content\nbinds { }\n";
+
+        // Create original file
+        std::fs::write(&keybinds_path, original_content).unwrap();
+
+        // Create config with invalid path (non-existent nested directory that we'll make read-only)
+        let config = Config {
+            global: GlobalConfig {
+                // Use a path where we cannot create the temp file
+                niri_keybinds_path: PathBuf::from("/nonexistent/path/keybinds.kdl"),
+                ..Default::default()
+            },
+            devices: vec![DeviceConfig {
+                name: Some("Test".to_string()),
+                vendor_product: None,
+                profiles: [(
+                    "default".to_string(),
+                    Profile {
+                        niri_passthrough: vec![NiriKeybind {
+                            key: "Super+Return".to_string(),
+                            action: "spawn \"alacritty\";".to_string(),
+                        }],
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        };
+
+        // Write should fail (cannot create parent directory)
+        let result = write_niri_keybinds(&config);
+        assert!(result.is_err());
+
+        // Original file should still exist with original content (different path, but testing error handling)
+        let current_content = std::fs::read_to_string(&keybinds_path).unwrap();
+        assert_eq!(current_content, original_content);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

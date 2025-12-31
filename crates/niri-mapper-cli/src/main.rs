@@ -23,7 +23,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Validate the configuration file
-    Validate,
+    Validate {
+        /// Also enumerate devices and check which configured devices exist (read-only)
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// List available input devices
     Devices,
@@ -38,8 +42,12 @@ enum Commands {
     /// Show current daemon status
     Status,
 
-    /// Reload daemon configuration
-    Reload,
+    /// Start the daemon via systemctl
+    Start,
+
+    /// Stop the daemon via systemctl
+    Stop,
+    // TODO: v0.2.0 - reload via SIGHUP
 }
 
 fn main() -> miette::Result<()> {
@@ -57,15 +65,16 @@ fn main() -> miette::Result<()> {
     let config_path: PathBuf = shellexpand::tilde(&cli.config).into_owned().into();
 
     match cli.command {
-        Commands::Validate => cmd_validate(&config_path),
+        Commands::Validate { dry_run } => cmd_validate(&config_path, dry_run),
         Commands::Devices => cmd_devices(),
         Commands::Generate { output } => cmd_generate(&config_path, output),
         Commands::Status => cmd_status(),
-        Commands::Reload => cmd_reload(),
+        Commands::Start => cmd_start(),
+        Commands::Stop => cmd_stop(),
     }
 }
 
-fn cmd_validate(config_path: &PathBuf) -> miette::Result<()> {
+fn cmd_validate(config_path: &PathBuf, dry_run: bool) -> miette::Result<()> {
     println!("Validating configuration: {}", config_path.display());
 
     match niri_mapper_config::parse_config(config_path) {
@@ -79,14 +88,34 @@ fn cmd_validate(config_path: &PathBuf) -> miette::Result<()> {
                     device.profiles.len()
                 );
             }
+
+            if dry_run {
+                println!("\nDry run: checking device availability...");
+                check_device_availability(&config)?;
+            }
+
             Ok(())
         }
         Err(e) => Err(miette::miette!("{}", e)),
     }
 }
 
-fn cmd_devices() -> miette::Result<()> {
-    println!("Available input devices:\n");
+/// Information about a system device for matching
+struct SystemDevice {
+    name: String,
+    vendor: u16,
+    product: u16,
+}
+
+impl SystemDevice {
+    fn vendor_product(&self) -> String {
+        format!("{:04x}:{:04x}", self.vendor, self.product)
+    }
+}
+
+/// Enumerate all system input devices (read-only, no grabbing)
+fn enumerate_system_devices() -> miette::Result<Vec<SystemDevice>> {
+    let mut devices = Vec::new();
 
     for entry in std::fs::read_dir("/dev/input").into_diagnostic()? {
         let entry = entry.into_diagnostic()?;
@@ -103,27 +132,167 @@ fn cmd_devices() -> miette::Result<()> {
 
         match evdev::Device::open(&path) {
             Ok(device) => {
-                let name = device.name().unwrap_or("Unknown");
+                let name = device.name().unwrap_or("Unknown").to_string();
                 let id = device.input_id();
-                let vendor_product = format!("{:04x}:{:04x}", id.vendor(), id.product());
 
-                // Check if it's a keyboard
+                devices.push(SystemDevice {
+                    name,
+                    vendor: id.vendor(),
+                    product: id.product(),
+                });
+            }
+            Err(_) => {
+                // Skip devices we can't open (permission issues, etc.)
+            }
+        }
+    }
+
+    // Remove duplicates by name
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    devices.dedup_by(|a, b| a.name == b.name);
+
+    Ok(devices)
+}
+
+/// Check which configured devices exist in the system
+fn check_device_availability(config: &niri_mapper_config::Config) -> miette::Result<()> {
+    let system_devices = enumerate_system_devices()?;
+
+    let mut found_count = 0;
+    let mut missing_count = 0;
+
+    for device_config in &config.devices {
+        let config_name = device_config.name.as_deref().unwrap_or("<unnamed>");
+
+        // Match by name if specified
+        if let Some(ref name) = device_config.name {
+            let found = system_devices.iter().find(|d| &d.name == name);
+
+            match found {
+                Some(sys_dev) => {
+                    println!(
+                        "  [FOUND] \"{}\" (vendor:product {})",
+                        sys_dev.name,
+                        sys_dev.vendor_product()
+                    );
+                    found_count += 1;
+                }
+                None => {
+                    println!("  [MISSING] \"{}\"", config_name);
+                    missing_count += 1;
+                }
+            }
+        } else {
+            println!("  [SKIPPED] Device without name configured");
+        }
+    }
+
+    println!();
+    println!(
+        "Summary: {} found, {} missing",
+        found_count, missing_count
+    );
+
+    if missing_count > 0 {
+        println!("\nAvailable devices:");
+        for sys_dev in &system_devices {
+            println!("  - \"{}\" ({})", sys_dev.name, sys_dev.vendor_product());
+        }
+    }
+
+    Ok(())
+}
+
+/// Represents a detected input device with its properties
+struct DetectedDevice {
+    name: String,
+    device_type: DeviceType,
+}
+
+/// Type of input device
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DeviceType {
+    Keyboard,
+    Mouse,
+    Other,
+}
+
+impl DeviceType {
+    fn as_tag(&self) -> Option<&'static str> {
+        match self {
+            DeviceType::Keyboard => Some("[keyboard]"),
+            DeviceType::Mouse => Some("[mouse]"),
+            DeviceType::Other => None,
+        }
+    }
+}
+
+fn cmd_devices() -> miette::Result<()> {
+    let mut devices: Vec<DetectedDevice> = Vec::new();
+
+    for entry in std::fs::read_dir("/dev/input").into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let path = entry.path();
+
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("event"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        match evdev::Device::open(&path) {
+            Ok(device) => {
+                let name = device.name().unwrap_or("Unknown").to_string();
+
+                // Check if it's a keyboard (has KEY events and supports letter keys)
                 let is_keyboard = device.supported_events().contains(evdev::EventType::KEY)
                     && device
                         .supported_keys()
                         .map(|keys| keys.contains(evdev::Key::KEY_A))
                         .unwrap_or(false);
 
-                let device_type = if is_keyboard { "keyboard" } else { "other" };
+                // Check if it's a mouse (has relative axes for movement)
+                let is_mouse = device
+                    .supported_events()
+                    .contains(evdev::EventType::RELATIVE)
+                    && device
+                        .supported_relative_axes()
+                        .map(|axes| {
+                            axes.contains(evdev::RelativeAxisType::REL_X)
+                                && axes.contains(evdev::RelativeAxisType::REL_Y)
+                        })
+                        .unwrap_or(false);
 
-                println!("  {} [{}]", name, device_type);
-                println!("    Path: {}", path.display());
-                println!("    ID: {}", vendor_product);
-                println!();
+                let device_type = if is_keyboard {
+                    DeviceType::Keyboard
+                } else if is_mouse {
+                    DeviceType::Mouse
+                } else {
+                    DeviceType::Other
+                };
+
+                devices.push(DetectedDevice { name, device_type });
             }
             Err(_) => {
                 // Skip devices we can't open
             }
+        }
+    }
+
+    // Sort devices alphabetically by name (case-insensitive)
+    devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    // Remove duplicates (same device name)
+    devices.dedup_by(|a, b| a.name == b.name);
+
+    println!("Available input devices:");
+    for device in &devices {
+        match device.device_type.as_tag() {
+            Some(tag) => println!("  \"{}\" {}", device.name, tag),
+            None => println!("  \"{}\"", device.name),
         }
     }
 
@@ -161,15 +330,159 @@ fn cmd_generate(config_path: &PathBuf, output: Option<PathBuf>) -> miette::Resul
 }
 
 fn cmd_status() -> miette::Result<()> {
-    // TODO: Communicate with daemon via IPC
-    println!("Status: not implemented yet");
-    println!("(daemon IPC not yet implemented)");
+    use std::process::Command;
+
+    let output = Command::new("systemctl")
+        .args(["--user", "status", "niri-mapper"])
+        .output()
+        .into_diagnostic()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Check if service unit is not found
+    if stderr.contains("could not be found")
+        || stdout.contains("could not be found")
+        || stderr.contains("Unit niri-mapper.service could not be found")
+    {
+        println!("Status: not installed");
+        println!("The niri-mapper systemd user service is not installed.");
+        println!("\nTo install, run:");
+        println!("  niri-mapper install");
+        return Ok(());
+    }
+
+    // Parse the Active line to determine status
+    // Format: "Active: active (running) since ..."
+    //     or: "Active: inactive (dead)"
+    //     or: "Active: failed (Result: ...)"
+    let mut status = "unknown";
+    let mut pid: Option<u32> = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+
+        if line.starts_with("Active:") {
+            if line.contains("active (running)") {
+                status = "running";
+            } else if line.contains("inactive") || line.contains("dead") {
+                status = "stopped";
+            } else if line.contains("failed") {
+                status = "failed";
+            } else if line.contains("activating") {
+                status = "starting";
+            } else if line.contains("deactivating") {
+                status = "stopping";
+            }
+        }
+
+        // Parse Main PID line
+        // Format: "Main PID: 12345 (niri-mapper)"
+        if line.starts_with("Main PID:") {
+            if let Some(pid_str) = line
+                .strip_prefix("Main PID:")
+                .and_then(|s| s.split_whitespace().next())
+            {
+                pid = pid_str.parse().ok();
+            }
+        }
+    }
+
+    // Display status
+    match status {
+        "running" => {
+            println!("Status: running");
+            if let Some(p) = pid {
+                println!("PID: {}", p);
+            }
+        }
+        "stopped" => {
+            println!("Status: stopped");
+        }
+        "failed" => {
+            println!("Status: failed");
+            println!("\nCheck logs with:");
+            println!("  journalctl --user -u niri-mapper -e");
+        }
+        "starting" => {
+            println!("Status: starting...");
+        }
+        "stopping" => {
+            println!("Status: stopping...");
+        }
+        _ => {
+            println!("Status: {}", status);
+        }
+    }
+
     Ok(())
 }
 
-fn cmd_reload() -> miette::Result<()> {
-    // TODO: Send SIGHUP to daemon
-    println!("Reload: not implemented yet");
-    println!("(daemon IPC not yet implemented)");
+fn cmd_start() -> miette::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("systemctl")
+        .args(["--user", "start", "niri-mapper"])
+        .output()
+        .into_diagnostic()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Check if service unit is not found
+    if stderr.contains("could not be found")
+        || stderr.contains("Unit niri-mapper.service could not be found")
+    {
+        println!("Error: niri-mapper service is not installed.");
+        println!("\nTo install, run:");
+        println!("  niri-mapper install");
+        return Ok(());
+    }
+
+    if output.status.success() {
+        println!("Started niri-mapper service.");
+    } else {
+        println!("Failed to start niri-mapper service.");
+        if !stderr.is_empty() {
+            println!("Error: {}", stderr.trim());
+        }
+        println!("\nCheck logs with:");
+        println!("  journalctl --user -u niri-mapper -e");
+    }
+
     Ok(())
 }
+
+fn cmd_stop() -> miette::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("systemctl")
+        .args(["--user", "stop", "niri-mapper"])
+        .output()
+        .into_diagnostic()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Check if service unit is not found
+    if stderr.contains("could not be found")
+        || stderr.contains("Unit niri-mapper.service could not be found")
+    {
+        println!("Error: niri-mapper service is not installed.");
+        println!("\nTo install, run:");
+        println!("  niri-mapper install");
+        return Ok(());
+    }
+
+    if output.status.success() {
+        println!("Stopped niri-mapper service.");
+    } else {
+        println!("Failed to stop niri-mapper service.");
+        if !stderr.is_empty() {
+            println!("Error: {}", stderr.trim());
+        }
+        println!("\nCheck logs with:");
+        println!("  journalctl --user -u niri-mapper -e");
+    }
+
+    Ok(())
+}
+

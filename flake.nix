@@ -48,6 +48,11 @@
             nativeBuildInputs = nativeBuildInputs;
             buildInputs = buildInputs;
 
+            postInstall = ''
+              install -Dm644 systemd/niri-mapper.service $out/lib/systemd/user/niri-mapper.service
+              install -Dm644 systemd/niri-mapper.user.service $out/lib/systemd/user/niri-mapper.user.service
+            '';
+
             meta = with pkgs.lib; {
               description = "Input remapping daemon for niri";
               homepage = "https://github.com/barrulus/niri-mapper";

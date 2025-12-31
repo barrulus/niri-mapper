@@ -9,11 +9,8 @@ ExecStart=/usr/bin/niri-mapperd --config %h/.config/niri-mapper/config.kdl --for
 Restart=on-failure
 RestartSec=5
 
-# Security
-ProtectSystem=strict
-ProtectHome=read-only
+# Security hardening (user service compatible)
 PrivateTmp=true
-SupplementaryGroups=input
 
 [Install]
 WantedBy=graphical-session.target

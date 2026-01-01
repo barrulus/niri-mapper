@@ -1,3 +1,22 @@
+# niri-mapper user service
+#
+# Installation (non-NixOS):
+#   mkdir -p ~/.config/systemd/user
+#   cp niri-mapper.user.service ~/.config/systemd/user/niri-mapper.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now niri-mapper
+#
+# Prerequisites:
+#   - User must be in the 'input' group: sudo usermod -aG input $USER
+#   - Log out and back in after group change
+#   - niri-mapperd binary must be in /usr/bin (or adjust ExecStart path)
+#   - Config file at ~/.config/niri-mapper/config.kdl
+#
+# Management:
+#   systemctl --user status niri-mapper
+#   systemctl --user restart niri-mapper
+#   journalctl --user -u niri-mapper -f
+
 [Unit]
 Description=niri-mapper input remapping daemon
 After=graphical-session.target

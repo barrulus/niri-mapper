@@ -72,6 +72,8 @@ pub struct DuplicateKeybindInfo {
 pub enum KeyPosition {
     From,
     To,
+    /// Key in a macro action sequence
+    Action,
 }
 
 impl std::fmt::Display for KeyPosition {
@@ -79,6 +81,7 @@ impl std::fmt::Display for KeyPosition {
         match self {
             KeyPosition::From => write!(f, "from"),
             KeyPosition::To => write!(f, "to"),
+            KeyPosition::Action => write!(f, "action"),
         }
     }
 }

@@ -81,6 +81,39 @@
             modules = [
               # Provide required module arguments
               { _module.args = { inherit pkgs; }; }
+              # Provide NixOS-like options that our module expects to set
+              {
+                options = {
+                  assertions = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.unspecified;
+                    default = [];
+                  };
+                  environment.systemPackages = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.package;
+                    default = [];
+                  };
+                  environment.etc = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.attrsOf pkgs.lib.types.anything;
+                    default = {};
+                  };
+                  systemd.services = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.attrsOf pkgs.lib.types.anything;
+                    default = {};
+                  };
+                  systemd.tmpfiles.rules = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.str;
+                    default = [];
+                  };
+                  boot.kernelModules = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.str;
+                    default = [];
+                  };
+                  services.udev.extraRules = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.lines;
+                    default = "";
+                  };
+                };
+              }
               # Import our module
               (import ./nix/module.nix self)
               # Minimal valid configuration
@@ -90,7 +123,7 @@
                   settings = {
                     global = {
                       logLevel = "info";
-                      niriKeybindsPath = "~/.config/niri/niri-mapper-keybinds.kdl";
+                      niriKeybindsPath = "/etc/niri-mapper/keybinds.kdl";
                     };
                     devices = [
                       {
@@ -133,28 +166,38 @@
             modules = [
               # Provide required module arguments
               { _module.args = { inherit pkgs; }; }
-              # Provide xdg.configHome option that the hm-module expects
+              # Provide Home-Manager-like options that our module expects
               {
-                options.xdg.configHome = pkgs.lib.mkOption {
-                  type = pkgs.lib.types.str;
-                  default = "/home/testuser/.config";
-                };
-                options.home.packages = pkgs.lib.mkOption {
-                  type = pkgs.lib.types.listOf pkgs.lib.types.package;
-                  default = [];
-                };
-                options.xdg.configFile = pkgs.lib.mkOption {
-                  type = pkgs.lib.types.attrsOf (pkgs.lib.types.submodule {
-                    options.text = pkgs.lib.mkOption {
-                      type = pkgs.lib.types.str;
-                      default = "";
-                    };
-                  });
-                  default = {};
-                };
-                options.systemd.user.services = pkgs.lib.mkOption {
-                  type = pkgs.lib.types.attrsOf pkgs.lib.types.anything;
-                  default = {};
+                options = {
+                  assertions = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.unspecified;
+                    default = [];
+                  };
+                  warnings = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.str;
+                    default = [];
+                  };
+                  xdg.configHome = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.str;
+                    default = "/home/testuser/.config";
+                  };
+                  home.packages = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.listOf pkgs.lib.types.package;
+                    default = [];
+                  };
+                  xdg.configFile = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.attrsOf (pkgs.lib.types.submodule {
+                      options.text = pkgs.lib.mkOption {
+                        type = pkgs.lib.types.str;
+                        default = "";
+                      };
+                    });
+                    default = {};
+                  };
+                  systemd.user.services = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.attrsOf pkgs.lib.types.anything;
+                    default = {};
+                  };
                 };
               }
               # Import our module

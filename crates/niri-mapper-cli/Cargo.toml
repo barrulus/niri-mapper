@@ -20,3 +20,9 @@ shellexpand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 miette = { workspace = true, features = ["fancy"] }
+serde.workspace = true
+serde_json.workspace = true
+nix.workspace = true
+
+# Niri IPC types (Request, Response, Event enums)
+niri-ipc = "25.8"

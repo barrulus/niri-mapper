@@ -53,6 +53,17 @@ let
   # Profile submodule
   profileType = lib.types.submodule {
     options = {
+      appIdHint = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Application ID hint for automatic profile switching.
+          When set, this profile will be automatically activated when the
+          focused window matches this app-id pattern (e.g., "firefox", "org.mozilla.firefox").
+        '';
+        example = "org.mozilla.firefox";
+      };
+
       remap = lib.mkOption {
         type = lib.types.attrsOf lib.types.str;
         default = {};
@@ -110,6 +121,22 @@ let
           }
         '';
       };
+
+      profileSwitch = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = {};
+        description = ''
+          Keybind-to-profile mappings for switching between profiles.
+          Keys are key combinations (e.g., "Ctrl+Shift+1"), values are profile names.
+          The profile names must match profiles defined in the profiles attribute.
+        '';
+        example = lib.literalExpression ''
+          {
+            "Ctrl+Shift+1" = "default";
+            "Ctrl+Shift+2" = "gaming";
+          }
+        '';
+      };
     };
   };
 
@@ -158,7 +185,9 @@ let
 
     profileToKdl = level: name: profile: ''
       ${indent level}profile "${name}" {
-      ${lib.optionalString (profile.remap or {} != {}) ''
+      ${lib.optionalString (profile.appIdHint or null != null) ''
+      ${indent (level + 1)}app-id-hint "${profile.appIdHint}"
+      ''}${lib.optionalString (profile.remap or {} != {}) ''
       ${indent (level + 1)}remap {
       ${remapToKdl (level + 2) profile.remap}
       ${indent (level + 1)}}
@@ -173,9 +202,18 @@ let
       ''}${indent level}}
     '';
 
+    profileSwitchToKdl = level: profileSwitch:
+      lib.concatStringsSep "\n" (lib.mapAttrsToList (keybind: profileName:
+        "${indent level}\"${keybind}\" \"${profileName}\""
+      ) profileSwitch);
+
     deviceToKdl = device: ''
       device "${device.name}" {
-      ${lib.concatStringsSep "\n" (lib.mapAttrsToList (profileToKdl 1) (device.profiles or { default = {}; }))}
+      ${lib.optionalString ((device.profileSwitch or {}) != {}) ''
+      ${indent 1}profile-switch {
+      ${profileSwitchToKdl 2 device.profileSwitch}
+      ${indent 1}}
+      ''}${lib.concatStringsSep "\n" (lib.mapAttrsToList (profileToKdl 1) (device.profiles or { default = {}; }))}
       }
     '';
   in ''
@@ -236,6 +274,23 @@ in
   options.services.niri-mapper = {
     enable = lib.mkEnableOption "niri-mapper input remapping daemon";
 
+    serviceType = lib.mkOption {
+      type = lib.types.enum [ "user" "system" ];
+      default = "user";
+      description = ''
+        Whether to run niri-mapper as a user service or system service.
+
+        - "user": Runs under graphical-session.target, suitable for desktop use.
+          This is the recommended mode for most users.
+
+        - "system": (Future) Would run as a system-wide service.
+          This option is reserved for future implementation and currently
+          behaves the same as "user" mode.
+
+        Default: "user"
+      '';
+    };
+
     declarativeNiriKeybinds = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -279,18 +334,27 @@ in
           devices = [
             {
               name = "Keychron K3 Pro";
-              profiles.default = {
-                remap = {
-                  CapsLock = "Escape";
-                  Escape = "CapsLock";
+              profiles = {
+                default = {
+                  remap = {
+                    CapsLock = "Escape";
+                    Escape = "CapsLock";
+                  };
+                  niriPassthrough = [
+                    { key = "Super+Return"; action = "spawn \"alacritty\";"; }
+                    { key = "Super+d"; action = "spawn \"fuzzel\";"; }
+                  ];
+                  combo = {
+                    "Ctrl+Shift+Q" = "Alt+F4";
+                  };
                 };
-                niriPassthrough = [
-                  { key = "Super+Return"; action = "spawn \"alacritty\";"; }
-                  { key = "Super+d"; action = "spawn \"fuzzel\";"; }
-                ];
-                combo = {
-                  "Ctrl+Shift+Q" = "Alt+F4";
+                gaming = {
+                  remap = {};  # No remaps in gaming mode
                 };
+              };
+              profileSwitch = {
+                "Ctrl+Shift+1" = "default";
+                "Ctrl+Shift+2" = "gaming";
               };
             }
           ];

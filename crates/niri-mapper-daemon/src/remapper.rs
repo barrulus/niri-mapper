@@ -1,5 +1,50 @@
 //! Key remapping logic
 //!
+//! This module provides the core remapping functionality for niri-mapper, including:
+//! - Simple 1:1 key remapping
+//! - Combo (chord) remapping with modifier tracking
+//! - Macro execution
+//! - Per-device profile management with runtime switching
+//!
+//! # Per-Application Profile Foundation (v0.4.0)
+//!
+//! The [`DeviceRemapper`] struct provides the foundation for per-application
+//! profile switching. v0.4.0 implements:
+//!
+//! ## Current Capabilities
+//!
+//! - **Active profile tracking**: Each device tracks which profile is currently active
+//! - **Runtime profile switching**: [`DeviceRemapper::switch_profile()`] swaps the
+//!   active remapping rules at runtime
+//! - **Profile switch keybinds**: Configure key combos to switch profiles directly
+//!   from the keyboard
+//!
+//! ## Manual Switching Methods
+//!
+//! 1. **Keybinds**: Configure `profile-switch` block in device config
+//!    ```kdl
+//!    profile-switch {
+//!        Ctrl+Shift+1 "default"
+//!        Ctrl+Shift+2 "gaming"
+//!    }
+//!    ```
+//!
+//! 2. **CLI**: `niri-mapper switch-profile <device> <profile>`
+//!
+//! 3. **Control socket**: `{"switch_profile": {"device": "...", "profile": "..."}}`
+//!
+//! ## Future: Automatic Switching (Backlog)
+//!
+//! Automatic profile switching based on focused application's `app_id` is **not
+//! implemented** in v0.4.0. The intended future behavior:
+//!
+//! 1. Daemon monitors niri focus change events
+//! 2. On focus change, looks up profiles with matching `app_id_hint`
+//! 3. Calls `switch_profile()` automatically for matching profiles
+//!
+//! The [`Profile::app_id_hint`](niri_mapper_config::Profile::app_id_hint) field
+//! exists for users to annotate their profiles in preparation for this feature.
+//!
 //! # Combo State Machine Design (Task 020-2.1)
 //!
 //! The combo remapping system uses a state machine to track modifier keys and detect
@@ -86,7 +131,38 @@ use std::fmt;
 use std::str::FromStr;
 
 use evdev::{InputEvent, Key};
-use niri_mapper_config::Profile;
+use niri_mapper_config::{MacroAction, Profile};
+
+// ============================================================================
+// RemapResult (Task 030-1.2.4, 030-3.3.3)
+// ============================================================================
+
+/// Result of processing an input event through the remapper.
+///
+/// This enum allows the caller to distinguish between different types of
+/// remapping results that require different handling:
+/// - Direct events can be emitted immediately to the virtual device
+/// - Macros require async execution with delays
+/// - Profile switches require updating the remapper state
+#[derive(Debug, Clone)]
+pub enum RemapResult {
+    /// Direct key events to emit to the virtual device.
+    ///
+    /// These events can be written directly to uinput without any additional processing.
+    Events(Vec<InputEvent>),
+
+    /// A macro sequence that should be executed asynchronously.
+    ///
+    /// The caller should spawn an async task to execute these actions,
+    /// which may include delays between key presses.
+    Macro(Vec<MacroAction>),
+
+    /// A profile switch was triggered by a keybind.
+    ///
+    /// The caller should switch to the named profile. The profile switch
+    /// keybind itself is consumed (no events are emitted for it).
+    ProfileSwitch(String),
+}
 
 // ============================================================================
 // Combo Types (Task 020-2.1, 020-2.3)
@@ -906,6 +982,7 @@ impl ComboTracker {
 // ============================================================================
 
 /// Remapper handles translating input events according to a profile
+#[derive(Debug)]
 pub struct Remapper {
     /// Simple key remaps (from -> to)
     remap: HashMap<Key, Key>,
@@ -928,6 +1005,14 @@ pub struct Remapper {
     /// combo mappings. When a combo like "Ctrl+Shift+Q" is detected, it can
     /// be remapped to a different combo like "Alt+F4".
     combo_tracker: ComboTracker,
+    /// Macro triggers: maps a trigger key to a sequence of macro actions
+    ///
+    /// When a key in this map is pressed, the associated macro action sequence
+    /// should be executed instead of the normal key event. The sequence can
+    /// contain key presses/releases and delays.
+    ///
+    /// Populated by `from_profile()` from `profile.macros` configuration.
+    macro_triggers: HashMap<Key, Vec<MacroAction>>,
 }
 
 impl Remapper {
@@ -964,12 +1049,137 @@ impl Remapper {
 
         // TODO: Parse passthrough keys from niri_passthrough
 
+        // Parse macro triggers from profile.macros (Task 030-1.2.2)
+        // For v0.3.0, only single-key triggers are supported (combo triggers are Out of Scope)
+        let mut macro_triggers = HashMap::new();
+        for (trigger_str, actions) in &profile.macros {
+            match parse_key(trigger_str) {
+                Some(trigger_key) => {
+                    tracing::debug!(
+                        "Registered macro trigger: {} -> {} actions",
+                        trigger_str,
+                        actions.len()
+                    );
+                    macro_triggers.insert(trigger_key, actions.clone());
+                }
+                None => {
+                    // Fail hard on invalid trigger keys as per task requirements
+                    panic!(
+                        "Invalid macro trigger key '{}': unknown key name. \
+                         Valid keys include: A-Z, 0-9, F1-F24, Escape, Tab, etc.",
+                        trigger_str
+                    );
+                }
+            }
+        }
+
         Self {
             remap,
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker,
+            macro_triggers,
         }
+    }
+
+    /// Switch to a new profile, replacing all remap/combo/macro rules.
+    ///
+    /// This method reloads the remapper with rules from a new profile while
+    /// preserving the current modifier key state (since physical keys may still
+    /// be pressed during the switch).
+    ///
+    /// # Arguments
+    ///
+    /// * `profile` - The new profile to switch to
+    ///
+    /// # Behavior
+    ///
+    /// - All remap rules are replaced with the new profile's rules
+    /// - All combo mappings are replaced with the new profile's combos
+    /// - All macro triggers are replaced with the new profile's macros
+    /// - Currently held modifiers are preserved (not cleared)
+    /// - Any active combo is cleared (to avoid stale state)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the profile contains invalid macro trigger key names (same as
+    /// `from_profile()`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In the event loop, when profile switch is requested:
+    /// if let Some(profile) = device_config.profiles.get(&new_profile_name) {
+    ///     remapper.switch_profile(profile);
+    ///     tracing::info!("Switched to profile '{}'", new_profile_name);
+    /// }
+    /// ```
+    pub fn switch_profile(&mut self, profile: &Profile) {
+        // Clear existing rules
+        self.remap.clear();
+        self.passthrough.clear();
+        self.macro_triggers.clear();
+
+        // Clear active combo state to avoid stale output tracking
+        // Note: held_modifiers is preserved since physical keys may still be pressed
+        self.combo_tracker.clear_active_combo();
+        self.combo_tracker.combos.clear();
+
+        // Reload remap rules from new profile
+        for (from, to) in &profile.remap {
+            if let (Some(from_key), Some(to_key)) = (parse_key(from), parse_key(to)) {
+                self.remap.insert(from_key, to_key);
+            }
+        }
+
+        // Reload combo mappings from new profile
+        for (input_str, output_str) in &profile.combo {
+            match (parse_combo(input_str), parse_combo(output_str)) {
+                (Ok(input_combo), Ok(output_combo)) => {
+                    tracing::debug!(
+                        "Registered combo: {} -> {}",
+                        input_combo,
+                        output_combo
+                    );
+                    self.combo_tracker.register_combo(input_combo, output_combo);
+                }
+                (Err(e), _) => {
+                    tracing::warn!("Failed to parse input combo '{}': {}", input_str, e);
+                }
+                (_, Err(e)) => {
+                    tracing::warn!("Failed to parse output combo '{}': {}", output_str, e);
+                }
+            }
+        }
+
+        // Reload macro triggers from new profile
+        for (trigger_str, actions) in &profile.macros {
+            match parse_key(trigger_str) {
+                Some(trigger_key) => {
+                    tracing::debug!(
+                        "Registered macro trigger: {} -> {} actions",
+                        trigger_str,
+                        actions.len()
+                    );
+                    self.macro_triggers.insert(trigger_key, actions.clone());
+                }
+                None => {
+                    // Fail hard on invalid trigger keys as per task requirements
+                    panic!(
+                        "Invalid macro trigger key '{}': unknown key name. \
+                         Valid keys include: A-Z, 0-9, F1-F24, Escape, Tab, etc.",
+                        trigger_str
+                    );
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Profile switched: {} remaps, {} combos, {} macros",
+            self.remap.len(),
+            self.combo_tracker.combos.len(),
+            self.macro_triggers.len()
+        );
     }
 
     /// Get the currently held modifiers.
@@ -994,7 +1204,7 @@ impl Remapper {
     ///
     /// * `key` - The key that generated the event
     /// * `value` - The event value (0=release, 1=press, 2=repeat)
-    fn update_held_modifiers(&mut self, key: Key, value: i32) {
+    pub fn update_held_modifiers(&mut self, key: Key, value: i32) {
         // Check if this key is a modifier
         if let Some(modifier) = Modifier::from_key(key) {
             match value {
@@ -1018,7 +1228,7 @@ impl Remapper {
         }
     }
 
-    /// Process an input event, returning the remapped event(s)
+    /// Process an input event, returning the remapped result.
     ///
     /// Key event values are preserved through remapping:
     /// - `0` = key release
@@ -1026,19 +1236,23 @@ impl Remapper {
     /// - `2` = key repeat (autorepeat)
     ///
     /// This method also updates the internal modifier tracking state and handles
-    /// combo detection and remapping.
+    /// combo detection, remapping, and macro trigger detection.
     ///
-    /// # Combo Processing
+    /// # Processing Order
     ///
-    /// When processing key events, combos are checked before simple remaps:
-    /// 1. On key press: If the key + held modifiers match a registered combo,
-    ///    the combo's output events are generated instead of the original key.
-    /// 2. On key release: If there's an active combo for this key, release
-    ///    events for the output combo are generated and input modifiers restored.
-    pub fn process(&mut self, event: InputEvent) -> Vec<InputEvent> {
+    /// On key press (value == 1), events are checked in this order:
+    /// 1. **Macro triggers**: If the key matches a registered macro trigger,
+    ///    return `RemapResult::Macro` with the action sequence.
+    /// 2. **Combo matching**: If the key + held modifiers match a registered combo,
+    ///    the combo's output events are generated.
+    /// 3. **Simple remaps**: If the key is in the remap table, remap it.
+    /// 4. **Passthrough**: Otherwise, pass through unchanged.
+    ///
+    /// On key release/repeat, macro triggers are NOT checked (only on press).
+    pub fn process(&mut self, event: InputEvent) -> RemapResult {
         // Only process key events
         if event.event_type() != evdev::EventType::KEY {
-            return vec![event];
+            return RemapResult::Events(vec![event]);
         }
 
         let key = Key::new(event.code());
@@ -1050,6 +1264,12 @@ impl Remapper {
 
         match value {
             event_value::PRESS => {
+                // Task 030-1.2.3: Check for macro trigger on key press FIRST
+                // Macros take priority over combos and simple remaps
+                if let Some(actions) = self.macro_triggers.get(&key) {
+                    return RemapResult::Macro(actions.clone());
+                }
+
                 // Check for combo match on key press
                 let match_result = self.combo_tracker.check_combo_match(key);
 
@@ -1061,16 +1281,16 @@ impl Remapper {
                         // Activate the combo to track it for release handling
                         self.combo_tracker.activate_combo(key, input.modifiers, output);
 
-                        return press_events;
+                        return RemapResult::Events(press_events);
                     }
                     ComboMatchResult::NoMatch => {
                         // No combo match, check for simple remap
                         if let Some(&remapped_key) = self.remap.get(&key) {
-                            return vec![InputEvent::new(
+                            return RemapResult::Events(vec![InputEvent::new(
                                 evdev::EventType::KEY,
                                 remapped_key.code(),
                                 value,
-                            )];
+                            )]);
                         }
                     }
                 }
@@ -1080,16 +1300,16 @@ impl Remapper {
                 if self.combo_tracker.has_active_combo_for(key) {
                     // Generate release events for the output combo
                     let release_events = self.combo_tracker.handle_trigger_release(key);
-                    return release_events;
+                    return RemapResult::Events(release_events);
                 }
 
                 // No active combo, check for simple remap
                 if let Some(&remapped_key) = self.remap.get(&key) {
-                    return vec![InputEvent::new(
+                    return RemapResult::Events(vec![InputEvent::new(
                         evdev::EventType::KEY,
                         remapped_key.code(),
                         value,
-                    )];
+                    )]);
                 }
             }
             event_value::REPEAT => {
@@ -1097,21 +1317,21 @@ impl Remapper {
                 if let Some(active) = self.combo_tracker.get_active_combo() {
                     if active.trigger_key == key {
                         // Repeat the output key, not the input key
-                        return vec![InputEvent::new(
+                        return RemapResult::Events(vec![InputEvent::new(
                             evdev::EventType::KEY,
                             active.output_combo.key.code(),
                             value,
-                        )];
+                        )]);
                     }
                 }
 
                 // No active combo, check for simple remap
                 if let Some(&remapped_key) = self.remap.get(&key) {
-                    return vec![InputEvent::new(
+                    return RemapResult::Events(vec![InputEvent::new(
                         evdev::EventType::KEY,
                         remapped_key.code(),
                         value,
-                    )];
+                    )]);
                 }
             }
             _ => {
@@ -1120,7 +1340,7 @@ impl Remapper {
         }
 
         // Pass through unmodified
-        vec![event]
+        RemapResult::Events(vec![event])
     }
 
     /// Get the combo tracker for inspection (useful for testing and debugging).
@@ -1129,8 +1349,409 @@ impl Remapper {
     }
 }
 
+// ============================================================================
+// DeviceRemapper (Task 030-3.1.1)
+// ============================================================================
+
+/// Error returned when profile operations fail
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileError {
+    /// The profile name that caused the error
+    pub profile: String,
+    /// Description of what went wrong
+    pub reason: String,
+}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "profile '{}': {}", self.profile, self.reason)
+    }
+}
+
+impl std::error::Error for ProfileError {}
+
+/// Per-device profile management and remapping.
+///
+/// `DeviceRemapper` wraps a `Remapper` and adds the ability to manage multiple
+/// named profiles for a single device. It tracks which profile is currently
+/// active and allows switching between profiles at runtime.
+///
+/// # Per-Application Profile Foundation (v0.4.0)
+///
+/// This struct is the core component of the per-application profile system.
+/// In v0.4.0, it provides the foundation for profile switching:
+///
+/// ## Current Capabilities
+///
+/// - **Profile storage**: Holds all configured profiles for the device
+/// - **Active profile tracking**: Tracks which profile is currently in use
+/// - **Runtime switching**: [`switch_profile()`](Self::switch_profile) replaces
+///   the active remapper with a new profile's rules
+/// - **Profile switch keybinds**: Detects keybind combos and returns
+///   [`RemapResult::ProfileSwitch`] for the caller to handle
+///
+/// ## How Profile Switching Works
+///
+/// 1. User triggers a switch (via keybind, CLI, or control socket)
+/// 2. `switch_profile()` is called with the target profile name
+/// 3. A new `Remapper` is built from the target profile's configuration
+/// 4. The active profile name and remapper are updated atomically
+/// 5. Subsequent key events use the new profile's remapping rules
+///
+/// ## Future: Automatic Switching (Backlog)
+///
+/// In a future release, the daemon will automatically call `switch_profile()`
+/// when the focused window's `app_id` matches a profile's `app_id_hint`.
+/// This is **not implemented** in v0.4.0 - profiles must be switched manually.
+///
+/// The `app_id_hint` field in [`Profile`](niri_mapper_config::Profile) exists
+/// for users to annotate their profiles in preparation for automatic switching.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::collections::HashMap;
+/// use niri_mapper_config::Profile;
+///
+/// let mut profiles = HashMap::new();
+/// profiles.insert("default".to_string(), Profile::default());
+/// profiles.insert("gaming".to_string(), Profile::default());
+///
+/// let mut device_remapper = DeviceRemapper::new(
+///     "Keychron K3 Pro".to_string(),
+///     profiles,
+///     "default",
+/// )?;
+///
+/// assert_eq!(device_remapper.active_profile(), "default");
+///
+/// // Manual profile switch
+/// device_remapper.switch_profile("gaming")?;
+/// assert_eq!(device_remapper.active_profile(), "gaming");
+/// ```
+#[derive(Debug)]
+pub struct DeviceRemapper {
+    /// The name of the device this remapper is for
+    device_name: String,
+    /// All available profiles for this device
+    profiles: HashMap<String, Profile>,
+    /// The name of the currently active profile
+    active_profile: String,
+    /// The current remapper instance, derived from the active profile
+    remapper: Remapper,
+    /// Profile switch keybinds: maps combo -> profile name (Task 030-3.3.3)
+    ///
+    /// When a key event matches one of these combos (on key press), the remapper
+    /// returns `RemapResult::ProfileSwitch` instead of normal events. The caller
+    /// is responsible for handling the actual profile switch.
+    profile_switch_combos: HashMap<KeyCombo, String>,
+}
+
+impl DeviceRemapper {
+    /// Create a new DeviceRemapper for a device with the given profiles.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_name` - The name of the device (for logging/identification)
+    /// * `profiles` - A map of profile names to Profile configurations
+    /// * `default_profile` - The name of the profile to use initially
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProfileError` if `default_profile` does not exist in `profiles`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut profiles = HashMap::new();
+    /// profiles.insert("default".to_string(), Profile::default());
+    ///
+    /// let remapper = DeviceRemapper::new(
+    ///     "My Keyboard".to_string(),
+    ///     profiles,
+    ///     "default",
+    /// )?;
+    /// ```
+    pub fn new(
+        device_name: String,
+        profiles: HashMap<String, Profile>,
+        default_profile: &str,
+    ) -> Result<Self, ProfileError> {
+        Self::new_with_profile_switch(device_name, profiles, default_profile, HashMap::new())
+    }
+
+    /// Create a new DeviceRemapper with profile switch keybinds.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_name` - The name of the device (for logging/identification)
+    /// * `profiles` - A map of profile names to Profile configurations
+    /// * `default_profile` - The name of the profile to use initially
+    /// * `profile_switch` - Map of combo strings (e.g., "Ctrl+Shift+1") to profile names
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ProfileError` if:
+    /// - `default_profile` does not exist in `profiles`
+    /// - A profile_switch combo string fails to parse
+    /// - A profile_switch references a non-existent profile
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut profiles = HashMap::new();
+    /// profiles.insert("default".to_string(), Profile::default());
+    /// profiles.insert("gaming".to_string(), Profile::default());
+    ///
+    /// let mut profile_switch = HashMap::new();
+    /// profile_switch.insert("Ctrl+Shift+1".to_string(), "default".to_string());
+    /// profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+    ///
+    /// let remapper = DeviceRemapper::new_with_profile_switch(
+    ///     "My Keyboard".to_string(),
+    ///     profiles,
+    ///     "default",
+    ///     profile_switch,
+    /// )?;
+    /// ```
+    pub fn new_with_profile_switch(
+        device_name: String,
+        profiles: HashMap<String, Profile>,
+        default_profile: &str,
+        profile_switch: HashMap<String, String>,
+    ) -> Result<Self, ProfileError> {
+        // Validate that the default profile exists
+        let profile = profiles.get(default_profile).ok_or_else(|| ProfileError {
+            profile: default_profile.to_string(),
+            reason: format!(
+                "profile not found in device '{}' (available profiles: {})",
+                device_name,
+                profiles
+                    .keys()
+                    .map(|s| format!("'{}'", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })?;
+
+        // Build the initial Remapper from the default profile
+        let remapper = Remapper::from_profile(profile);
+
+        // Parse profile switch keybinds (Task 030-3.3.3)
+        let mut profile_switch_combos = HashMap::new();
+        for (combo_str, target_profile) in profile_switch {
+            // Validate that the target profile exists
+            if !profiles.contains_key(&target_profile) {
+                return Err(ProfileError {
+                    profile: target_profile.clone(),
+                    reason: format!(
+                        "profile-switch keybind '{}' references non-existent profile '{}' \
+                         (available profiles: {})",
+                        combo_str,
+                        target_profile,
+                        profiles
+                            .keys()
+                            .map(|s| format!("'{}'", s))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+
+            // Parse the combo string
+            match parse_combo(&combo_str) {
+                Ok(combo) => {
+                    tracing::debug!(
+                        "Registered profile switch: {} -> '{}'",
+                        combo,
+                        target_profile
+                    );
+                    profile_switch_combos.insert(combo, target_profile);
+                }
+                Err(e) => {
+                    return Err(ProfileError {
+                        profile: target_profile,
+                        reason: format!(
+                            "failed to parse profile-switch keybind '{}': {}",
+                            combo_str, e
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            device_name,
+            profiles,
+            active_profile: default_profile.to_string(),
+            remapper,
+            profile_switch_combos,
+        })
+    }
+
+    /// Get the device name.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// Get the name of the currently active profile.
+    pub fn active_profile(&self) -> &str {
+        &self.active_profile
+    }
+
+    /// Get a reference to the inner `Remapper` for event processing.
+    ///
+    /// Use this to call `process()` on incoming events.
+    pub fn remapper(&self) -> &Remapper {
+        &self.remapper
+    }
+
+    /// Get a mutable reference to the inner `Remapper` for event processing.
+    ///
+    /// Use this to call `process()` on incoming events (which requires `&mut self`).
+    pub fn remapper_mut(&mut self) -> &mut Remapper {
+        &mut self.remapper
+    }
+
+    /// Get a list of all available profile names for this device.
+    pub fn profile_names(&self) -> Vec<&str> {
+        self.profiles.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Check if a profile with the given name exists.
+    pub fn has_profile(&self, name: &str) -> bool {
+        self.profiles.contains_key(name)
+    }
+
+    /// Switch to a different profile by name.
+    ///
+    /// This method looks up the named profile, builds a new `Remapper` from it,
+    /// and replaces the current remapper. The active profile name is also updated.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile_name` - The name of the profile to switch to
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProfileError` if the profile doesn't exist.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut device_remapper = DeviceRemapper::new(
+    ///     "My Keyboard".to_string(),
+    ///     profiles,
+    ///     "default",
+    /// )?;
+    ///
+    /// // Switch to a different profile
+    /// device_remapper.switch_profile("gaming")?;
+    /// assert_eq!(device_remapper.active_profile(), "gaming");
+    /// ```
+    pub fn switch_profile(&mut self, profile_name: &str) -> Result<(), ProfileError> {
+        // 1. Validate profile exists in self.profiles
+        let profile = self.profiles.get(profile_name).ok_or_else(|| ProfileError {
+            profile: profile_name.to_string(),
+            reason: format!(
+                "profile not found in device '{}' (available profiles: {})",
+                self.device_name,
+                self.profiles
+                    .keys()
+                    .map(|s| format!("'{}'", s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })?;
+
+        // 2. Build a new Remapper from the profile
+        let new_remapper = Remapper::from_profile(profile);
+
+        // 3. Update active_profile
+        self.active_profile = profile_name.to_string();
+
+        // 4. Replace self.remapper with the new one
+        self.remapper = new_remapper;
+
+        Ok(())
+    }
+
+    /// Process an input event through the remapper (Task 030-3.3.3).
+    ///
+    /// This method first checks if the incoming key event matches a profile switch
+    /// keybind. If so, it returns `RemapResult::ProfileSwitch` and the caller is
+    /// responsible for actually switching the profile.
+    ///
+    /// If no profile switch keybind matches, the event is processed through the
+    /// inner `Remapper` as usual.
+    ///
+    /// # Profile Switch Detection
+    ///
+    /// Profile switch combos are checked on key press events only (value == 1).
+    /// When the held modifiers and the pressed key match a registered profile
+    /// switch combo, the keybind is consumed (no events are emitted) and
+    /// `RemapResult::ProfileSwitch` is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The input event to process
+    ///
+    /// # Returns
+    ///
+    /// * `RemapResult::ProfileSwitch(profile_name)` - A profile switch was triggered
+    /// * `RemapResult::Events(events)` - Normal remapped/passthrough events
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// match device_remapper.process(event) {
+    ///     RemapResult::ProfileSwitch(profile_name) => {
+    ///         device_remapper.switch_profile(&profile_name)?;
+    ///     }
+    ///     RemapResult::Events(events) => {
+    ///         virtual_device.emit(&events)?;
+    ///     }
+    ///     RemapResult::Macro(actions) => {
+    ///         executor.execute_macro(&actions).await?;
+    ///     }
+    /// }
+    /// ```
+    pub fn process(&mut self, event: InputEvent) -> RemapResult {
+        // Only check for profile switch on key events
+        if event.event_type() == evdev::EventType::KEY {
+            let key = Key::new(event.code());
+            let value = event.value();
+
+            // Update the remapper's modifier tracking for every key event
+            // This ensures we have accurate modifier state for combo matching
+            self.remapper.update_held_modifiers(key, value);
+
+            // Check for profile switch combo on key press only
+            if value == event_value::PRESS {
+                // Check if current key + held modifiers match any profile switch combo
+                let held_mods = self.remapper.held_modifiers().clone();
+
+                for (combo, profile_name) in &self.profile_switch_combos {
+                    if combo.key == key && combo.modifiers == held_mods {
+                        tracing::info!(
+                            "Profile switch keybind detected: {} -> '{}'",
+                            combo,
+                            profile_name
+                        );
+                        return RemapResult::ProfileSwitch(profile_name.clone());
+                    }
+                }
+            }
+        }
+
+        // No profile switch match, delegate to inner Remapper
+        // Remapper::process() now returns RemapResult directly
+        self.remapper.process(event)
+    }
+}
+
 /// Parse a key name string to an evdev Key
-fn parse_key(name: &str) -> Option<Key> {
+pub(crate) fn parse_key(name: &str) -> Option<Key> {
     let upper = name.to_uppercase();
 
     // Common key mappings
@@ -1292,6 +1913,15 @@ fn parse_key(name: &str) -> Option<Key> {
 mod tests {
     use super::*;
 
+    /// Helper to extract events from RemapResult, panicking if not Events variant
+    fn expect_events(result: RemapResult) -> Vec<InputEvent> {
+        match result {
+            RemapResult::Events(e) => e,
+            RemapResult::Macro(actions) => panic!("Expected RemapResult::Events, got Macro({} actions)", actions.len()),
+            RemapResult::ProfileSwitch(name) => panic!("Expected RemapResult::Events, got ProfileSwitch({})", name),
+        }
+    }
+
     #[test]
     fn test_parse_key_basic() {
         assert_eq!(parse_key("CapsLock"), Some(Key::KEY_CAPSLOCK));
@@ -1417,16 +2047,21 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
         let press_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_CAPSLOCK.code(), KEY_PRESS);
         let result = remapper.process(press_event);
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_ESC.code(), "Key should be remapped from CapsLock to Escape");
-        assert_eq!(result[0].value(), KEY_PRESS, "Press event value (1) should be preserved");
-        assert_eq!(result[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
+        let events = match result {
+            RemapResult::Events(e) => e,
+            _ => panic!("Expected RemapResult::Events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_ESC.code(), "Key should be remapped from CapsLock to Escape");
+        assert_eq!(events[0].value(), KEY_PRESS, "Press event value (1) should be preserved");
+        assert_eq!(events[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
     }
 
     #[test]
@@ -1441,16 +2076,21 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_RELEASE: i32 = 0;
         let release_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_CAPSLOCK.code(), KEY_RELEASE);
         let result = remapper.process(release_event);
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_ESC.code(), "Key should be remapped from CapsLock to Escape");
-        assert_eq!(result[0].value(), KEY_RELEASE, "Release event value (0) should be preserved");
-        assert_eq!(result[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
+        let events = match result {
+            RemapResult::Events(e) => e,
+            _ => panic!("Expected RemapResult::Events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_ESC.code(), "Key should be remapped from CapsLock to Escape");
+        assert_eq!(events[0].value(), KEY_RELEASE, "Release event value (0) should be preserved");
+        assert_eq!(events[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
     }
 
     #[test]
@@ -1465,6 +2105,7 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
@@ -1473,18 +2114,26 @@ mod tests {
         // Test press event passthrough for unmapped key
         let press_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_PRESS);
         let result = remapper.process(press_event);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_A.code(), "Unmapped key should pass through unchanged");
-        assert_eq!(result[0].value(), KEY_PRESS, "Press event value should be preserved");
-        assert_eq!(result[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
+        let events = match result {
+            RemapResult::Events(e) => e,
+            _ => panic!("Expected RemapResult::Events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_A.code(), "Unmapped key should pass through unchanged");
+        assert_eq!(events[0].value(), KEY_PRESS, "Press event value should be preserved");
+        assert_eq!(events[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
 
         // Test release event passthrough for unmapped key
         let release_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_RELEASE);
         let result = remapper.process(release_event);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_A.code(), "Unmapped key should pass through unchanged");
-        assert_eq!(result[0].value(), KEY_RELEASE, "Release event value should be preserved");
-        assert_eq!(result[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
+        let events = match result {
+            RemapResult::Events(e) => e,
+            _ => panic!("Expected RemapResult::Events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_A.code(), "Unmapped key should pass through unchanged");
+        assert_eq!(events[0].value(), KEY_RELEASE, "Release event value should be preserved");
+        assert_eq!(events[0].event_type(), evdev::EventType::KEY, "Event type should remain KEY");
     }
 
     #[test]
@@ -1497,6 +2146,7 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         // Event value constants
@@ -1504,26 +2154,34 @@ mod tests {
         const KEY_PRESS: i32 = 1;
         const KEY_REPEAT: i32 = 2;
 
+        // Helper to extract events from RemapResult
+        let get_events = |r: RemapResult| -> Vec<InputEvent> {
+            match r {
+                RemapResult::Events(e) => e,
+                _ => panic!("Expected RemapResult::Events"),
+            }
+        };
+
         // Test press event (value=1) is preserved
         let press_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_PRESS);
-        let result = remapper.process(press_event);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
-        assert_eq!(result[0].value(), KEY_PRESS, "Press event value (1) should be preserved");
+        let events = get_events(remapper.process(press_event));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
+        assert_eq!(events[0].value(), KEY_PRESS, "Press event value (1) should be preserved");
 
         // Test release event (value=0) is preserved
         let release_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_RELEASE);
-        let result = remapper.process(release_event);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
-        assert_eq!(result[0].value(), KEY_RELEASE, "Release event value (0) should be preserved");
+        let events = get_events(remapper.process(release_event));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
+        assert_eq!(events[0].value(), KEY_RELEASE, "Release event value (0) should be preserved");
 
         // Test repeat event (value=2) is preserved
         let repeat_event = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_REPEAT);
-        let result = remapper.process(repeat_event);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
-        assert_eq!(result[0].value(), KEY_REPEAT, "Repeat event value (2) should be preserved");
+        let events = get_events(remapper.process(repeat_event));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_B.code(), "Key should be remapped from A to B");
+        assert_eq!(events[0].value(), KEY_REPEAT, "Repeat event value (2) should be preserved");
     }
 
     // ========================================================================
@@ -1821,6 +2479,7 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
@@ -1830,13 +2489,13 @@ mod tests {
 
         // Press left Ctrl
         let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS);
-        remapper.process(ctrl_press);
+        let _ = remapper.process(ctrl_press);
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl), "Ctrl should be tracked after press");
         assert_eq!(remapper.held_modifiers().len(), 1);
 
         // Press left Shift
         let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_PRESS);
-        remapper.process(shift_press);
+        let _ = remapper.process(shift_press);
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl), "Ctrl should still be tracked");
         assert!(remapper.held_modifiers().contains(&Modifier::Shift), "Shift should be tracked after press");
         assert_eq!(remapper.held_modifiers().len(), 2);
@@ -1850,24 +2509,25 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
         const KEY_RELEASE: i32 = 0;
 
         // Press Ctrl and Shift
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_PRESS));
         assert_eq!(remapper.held_modifiers().len(), 2);
 
         // Release Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_RELEASE));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_RELEASE));
         assert!(!remapper.held_modifiers().contains(&Modifier::Ctrl), "Ctrl should be removed after release");
         assert!(remapper.held_modifiers().contains(&Modifier::Shift), "Shift should still be tracked");
         assert_eq!(remapper.held_modifiers().len(), 1);
 
         // Release Shift
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_RELEASE));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_RELEASE));
         assert!(remapper.held_modifiers().is_empty(), "No modifiers should remain after all released");
     }
 
@@ -1879,19 +2539,20 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
         const KEY_REPEAT: i32 = 2;
 
         // Press Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
         assert_eq!(remapper.held_modifiers().len(), 1);
 
         // Multiple repeat events should not add duplicates
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_REPEAT));
         assert_eq!(remapper.held_modifiers().len(), 1, "Repeat events should not add duplicates");
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl));
     }
@@ -1904,15 +2565,16 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
 
         // Press all modifiers
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTALT.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTMETA.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTALT.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTMETA.code(), KEY_PRESS));
 
         assert_eq!(remapper.held_modifiers().len(), 4);
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl));
@@ -1929,23 +2591,24 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
         const KEY_RELEASE: i32 = 0;
 
         // Press left Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl));
         assert_eq!(remapper.held_modifiers().len(), 1);
 
         // Press right Ctrl - should NOT add a duplicate since both normalize to Modifier::Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_RIGHTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_RIGHTCTRL.code(), KEY_PRESS));
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl));
         assert_eq!(remapper.held_modifiers().len(), 1, "Left and right Ctrl should normalize to same modifier");
 
         // Release left Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_RELEASE));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_RELEASE));
         // Modifier is removed even though right Ctrl is still "physically" held
         // This is expected behavior - the normalized modifier tracks logical state
         assert!(!remapper.held_modifiers().contains(&Modifier::Ctrl));
@@ -1959,21 +2622,22 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
         const KEY_RELEASE: i32 = 0;
 
         // Press some non-modifier keys
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_B.code(), KEY_PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_SPACE.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_B.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_SPACE.code(), KEY_PRESS));
 
         assert!(remapper.held_modifiers().is_empty(), "Non-modifier keys should not be tracked");
 
         // Release them
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_RELEASE));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_B.code(), KEY_RELEASE));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), KEY_RELEASE));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_B.code(), KEY_RELEASE));
 
         assert!(remapper.held_modifiers().is_empty());
     }
@@ -1989,20 +2653,25 @@ mod tests {
             passthrough: Vec::new(),
             held_modifiers: HashSet::new(),
             combo_tracker: ComboTracker::new(),
+            macro_triggers: HashMap::new(),
         };
 
         const KEY_PRESS: i32 = 1;
 
         // Press Ctrl (modifier) and CapsLock (remapped)
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), KEY_PRESS));
         let result = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_CAPSLOCK.code(), KEY_PRESS));
 
         // Modifier should be tracked
         assert!(remapper.held_modifiers().contains(&Modifier::Ctrl));
 
         // Remapping should still work
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].code(), Key::KEY_ESC.code());
+        let events = match result {
+            RemapResult::Events(e) => e,
+            _ => panic!("Expected RemapResult::Events"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_ESC.code());
     }
 
     // ========================================================================
@@ -2900,10 +3569,10 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Press Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
 
         // Press Q - should trigger combo
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS)));
 
         // Should generate: Release Ctrl, Press Alt, Press F4
         assert_eq!(events.len(), 3, "Combo press should generate 3 events");
@@ -2932,11 +3601,11 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Activate combo: Ctrl+Q
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
 
         // Release Q - should release F4 and restore Ctrl
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::RELEASE));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::RELEASE)));
 
         // Should generate: Release F4, Release Alt, Press Ctrl (restore)
         assert_eq!(events.len(), 3, "Combo release should generate 3 events");
@@ -2965,11 +3634,11 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Activate combo
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
 
         // Repeat Q - should repeat F4, not Q
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::REPEAT));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::REPEAT)));
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].code(), Key::KEY_F4.code(), "Repeat should output F4, not Q");
@@ -2988,7 +3657,7 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Press CapsLock (should use simple remap, not combo)
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_CAPSLOCK.code(), event_value::PRESS));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_CAPSLOCK.code(), event_value::PRESS)));
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].code(), Key::KEY_ESC.code(), "CapsLock should be remapped to Escape");
@@ -3006,10 +3675,10 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Press Ctrl
-        remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
+        let _ = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS));
 
         // Press Q - should trigger combo, not simple remap
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS)));
 
         // Should be combo output, not W
         assert!(events.len() > 1, "Should trigger combo, not simple remap");
@@ -3029,7 +3698,7 @@ mod tests {
         let mut remapper = Remapper::from_profile(&profile);
 
         // Press Q without modifiers - should use simple remap
-        let events = remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS));
+        let events = expect_events(remapper.process(InputEvent::new(evdev::EventType::KEY, Key::KEY_Q.code(), event_value::PRESS)));
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].code(), Key::KEY_W.code(), "Q should be remapped to W when no combo matches");
@@ -3059,11 +3728,11 @@ mod tests {
         // ====================================================================
         // Step 1: Press Ctrl - verify held_modifiers is updated
         // ====================================================================
-        let events = remapper.process(InputEvent::new(
+        let events = expect_events(remapper.process(InputEvent::new(
             evdev::EventType::KEY,
             Key::KEY_LEFTCTRL.code(),
             event_value::PRESS,
-        ));
+        )));
 
         // Ctrl press should pass through (no combo match yet)
         assert_eq!(events.len(), 1);
@@ -3079,11 +3748,11 @@ mod tests {
         // ====================================================================
         // Step 2: Press Shift - verify held_modifiers is updated
         // ====================================================================
-        let events = remapper.process(InputEvent::new(
+        let events = expect_events(remapper.process(InputEvent::new(
             evdev::EventType::KEY,
             Key::KEY_LEFTSHIFT.code(),
             event_value::PRESS,
-        ));
+        )));
 
         // Shift press should pass through (no combo match yet)
         assert_eq!(events.len(), 1);
@@ -3104,11 +3773,11 @@ mod tests {
         // ====================================================================
         // Step 3: Press Q - verify combo triggers and output events are correct
         // ====================================================================
-        let events = remapper.process(InputEvent::new(
+        let events = expect_events(remapper.process(InputEvent::new(
             evdev::EventType::KEY,
             Key::KEY_Q.code(),
             event_value::PRESS,
-        ));
+        )));
 
         // Combo should trigger: Ctrl+Shift+Q -> Alt+F4
         // Expected events:
@@ -3137,11 +3806,11 @@ mod tests {
         // ====================================================================
         // Step 4: Release Q - verify release sequence is correct
         // ====================================================================
-        let events = remapper.process(InputEvent::new(
+        let events = expect_events(remapper.process(InputEvent::new(
             evdev::EventType::KEY,
             Key::KEY_Q.code(),
             event_value::RELEASE,
-        ));
+        )));
 
         // Release sequence for Q (combo trigger):
         // 1. Release F4 (output key)
@@ -3165,5 +3834,699 @@ mod tests {
         // Event 3: Restore Shift (still physically held)
         assert_eq!(events[3].code(), Key::KEY_LEFTSHIFT.code(), "Fourth event should restore Shift");
         assert_eq!(events[3].value(), event_value::PRESS);
+    }
+
+    // ========================================================================
+    // DeviceRemapper Tests (Task 030-3.1.1)
+    // ========================================================================
+
+    #[test]
+    fn test_device_remapper_new_success() {
+        // Test creating a DeviceRemapper with valid profiles and default profile
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        );
+
+        assert!(device_remapper.is_ok(), "should create DeviceRemapper successfully");
+        let device_remapper = device_remapper.unwrap();
+        assert_eq!(device_remapper.device_name(), "Test Keyboard");
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_device_remapper_new_invalid_default_profile() {
+        // Test that new() returns an error when default profile doesn't exist
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+
+        let result = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "nonexistent",
+        );
+
+        assert!(result.is_err(), "should return error for nonexistent default profile");
+        let err = result.unwrap_err();
+        assert_eq!(err.profile, "nonexistent");
+        assert!(err.reason.contains("profile not found"));
+    }
+
+    #[test]
+    fn test_device_remapper_new_empty_profiles() {
+        // Test that new() returns an error when profiles is empty
+        let profiles: HashMap<String, Profile> = HashMap::new();
+
+        let result = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        );
+
+        assert!(result.is_err(), "should return error for empty profiles");
+    }
+
+    #[test]
+    fn test_device_remapper_profile_names() {
+        // Test that profile_names() returns all available profiles
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+        profiles.insert("work".to_string(), Profile::default());
+
+        let device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        let names = device_remapper.profile_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"default"));
+        assert!(names.contains(&"gaming"));
+        assert!(names.contains(&"work"));
+    }
+
+    #[test]
+    fn test_device_remapper_has_profile() {
+        // Test has_profile() method
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        assert!(device_remapper.has_profile("default"));
+        assert!(device_remapper.has_profile("gaming"));
+        assert!(!device_remapper.has_profile("nonexistent"));
+    }
+
+    #[test]
+    fn test_device_remapper_remapper_access() {
+        // Test that we can access the inner remapper
+        let mut profiles = HashMap::new();
+        let mut profile = Profile::default();
+        profile.remap.insert("A".to_string(), "B".to_string());
+        profiles.insert("default".to_string(), profile);
+
+        let mut device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        // Test immutable access
+        let _remapper_ref = device_remapper.remapper();
+
+        // Test mutable access - process an event
+        let press_event = InputEvent::new(
+            evdev::EventType::KEY,
+            Key::KEY_A.code(),
+            event_value::PRESS,
+        );
+        let result = expect_events(device_remapper.remapper_mut().process(press_event));
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].code(), Key::KEY_B.code(), "A should be remapped to B");
+    }
+
+    // switch_profile() Tests (Task 030-3.1.2)
+    // ========================================================================
+
+    #[test]
+    fn test_device_remapper_switch_profile_success() {
+        // Test successfully switching between profiles
+        let mut profiles = HashMap::new();
+
+        // Default profile: A -> B
+        let mut default_profile = Profile::default();
+        default_profile.remap.insert("A".to_string(), "B".to_string());
+        profiles.insert("default".to_string(), default_profile);
+
+        // Gaming profile: A -> C
+        let mut gaming_profile = Profile::default();
+        gaming_profile.remap.insert("A".to_string(), "C".to_string());
+        profiles.insert("gaming".to_string(), gaming_profile);
+
+        let mut device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        // Verify initial state
+        assert_eq!(device_remapper.active_profile(), "default");
+
+        // Switch to gaming profile
+        let result = device_remapper.switch_profile("gaming");
+        assert!(result.is_ok(), "switch_profile should succeed for existing profile");
+        assert_eq!(device_remapper.active_profile(), "gaming");
+
+        // Verify the remapper now uses gaming profile mappings (A -> C)
+        let press_event = InputEvent::new(
+            evdev::EventType::KEY,
+            Key::KEY_A.code(),
+            event_value::PRESS,
+        );
+        let events = expect_events(device_remapper.remapper_mut().process(press_event));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_C.code(), "A should be remapped to C in gaming profile");
+    }
+
+    #[test]
+    fn test_device_remapper_switch_profile_nonexistent() {
+        // Test that switching to a nonexistent profile returns an error
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+
+        let mut device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        let result = device_remapper.switch_profile("nonexistent");
+        assert!(result.is_err(), "switch_profile should fail for nonexistent profile");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.profile, "nonexistent");
+        assert!(err.reason.contains("profile not found"));
+
+        // Verify the active profile hasn't changed
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_device_remapper_switch_profile_same_profile() {
+        // Test switching to the same profile (should succeed)
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+
+        let mut device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        let result = device_remapper.switch_profile("default");
+        assert!(result.is_ok(), "switch_profile should succeed even for the same profile");
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_device_remapper_switch_profile_multiple_switches() {
+        // Test switching between profiles multiple times
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+        profiles.insert("work".to_string(), Profile::default());
+
+        let mut device_remapper = DeviceRemapper::new(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+        ).unwrap();
+
+        // Switch through profiles
+        device_remapper.switch_profile("gaming").unwrap();
+        assert_eq!(device_remapper.active_profile(), "gaming");
+
+        device_remapper.switch_profile("work").unwrap();
+        assert_eq!(device_remapper.active_profile(), "work");
+
+        device_remapper.switch_profile("default").unwrap();
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    // ========================================================================
+    // Profile Switch via Keybind Tests (Task 030-3.7.1)
+    // ========================================================================
+    //
+    // These tests verify that pressing a profile switch keybind (e.g., Ctrl+Shift+1)
+    // correctly triggers a profile switch via RemapResult::ProfileSwitch.
+
+    #[test]
+    fn test_profile_switch_keybind_detection_basic() {
+        // Task 030-3.7.1: Test that pressing a profile switch keybind
+        // returns RemapResult::ProfileSwitch with the correct profile name.
+        //
+        // Setup:
+        // - Two profiles: "default" (A->B) and "gaming" (A->C)
+        // - Keybind: Ctrl+Shift+2 -> "gaming"
+        let mut profiles = HashMap::new();
+
+        let mut default_profile = Profile::default();
+        default_profile.remap.insert("A".to_string(), "B".to_string());
+        profiles.insert("default".to_string(), default_profile);
+
+        let mut gaming_profile = Profile::default();
+        gaming_profile.remap.insert("A".to_string(), "C".to_string());
+        profiles.insert("gaming".to_string(), gaming_profile);
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Verify initial state
+        assert_eq!(device_remapper.active_profile(), "default");
+
+        // Simulate pressing Ctrl+Shift+2:
+        // 1. Press LeftCtrl
+        let ctrl_press = InputEvent::new(
+            evdev::EventType::KEY,
+            Key::KEY_LEFTCTRL.code(),
+            event_value::PRESS,
+        );
+        let result = device_remapper.process(ctrl_press);
+        assert!(matches!(result, RemapResult::Events(_)), "Ctrl press should passthrough");
+
+        // 2. Press LeftShift
+        let shift_press = InputEvent::new(
+            evdev::EventType::KEY,
+            Key::KEY_LEFTSHIFT.code(),
+            event_value::PRESS,
+        );
+        let result = device_remapper.process(shift_press);
+        assert!(matches!(result, RemapResult::Events(_)), "Shift press should passthrough");
+
+        // 3. Press '2' - this should trigger profile switch to "gaming"
+        let key_2_press = InputEvent::new(
+            evdev::EventType::KEY,
+            Key::KEY_2.code(),
+            event_value::PRESS,
+        );
+        let result = device_remapper.process(key_2_press);
+
+        // Verify ProfileSwitch result
+        match result {
+            RemapResult::ProfileSwitch(profile_name) => {
+                assert_eq!(profile_name, "gaming", "Profile switch should be to 'gaming'");
+            }
+            other => panic!("Expected RemapResult::ProfileSwitch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_full_workflow() {
+        // Task 030-3.7.1: Full workflow test for keybind-based profile switching
+        //
+        // This test simulates the complete workflow:
+        // 1. Start with default profile
+        // 2. Press keybind to switch to gaming profile
+        // 3. Verify gaming profile's remapping is active
+        // 4. Press keybind to switch back to default
+        // 5. Verify default profile's remapping is active again
+
+        let mut profiles = HashMap::new();
+
+        // Default profile: A -> B
+        let mut default_profile = Profile::default();
+        default_profile.remap.insert("A".to_string(), "B".to_string());
+        profiles.insert("default".to_string(), default_profile);
+
+        // Gaming profile: A -> C
+        let mut gaming_profile = Profile::default();
+        gaming_profile.remap.insert("A".to_string(), "C".to_string());
+        profiles.insert("gaming".to_string(), gaming_profile);
+
+        // Profile switch keybinds
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+1".to_string(), "default".to_string());
+        profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // ============================================================
+        // Step 1: Verify default profile is active (A -> B)
+        // ============================================================
+        assert_eq!(device_remapper.active_profile(), "default");
+
+        let a_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), event_value::PRESS);
+        let result = device_remapper.process(a_press);
+        let events = expect_events(result);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_B.code(), "A should be remapped to B in default profile");
+
+        // Release A
+        let a_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), event_value::RELEASE);
+        let _ = device_remapper.process(a_release);
+
+        // ============================================================
+        // Step 2: Press Ctrl+Shift+2 to switch to gaming profile
+        // ============================================================
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::PRESS);
+        let _ = device_remapper.process(shift_press);
+
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+
+        // Handle the profile switch
+        match result {
+            RemapResult::ProfileSwitch(profile_name) => {
+                assert_eq!(profile_name, "gaming");
+                // Actually switch the profile
+                device_remapper.switch_profile(&profile_name).unwrap();
+            }
+            other => panic!("Expected ProfileSwitch for Ctrl+Shift+2, got {:?}", other),
+        }
+
+        // Release modifiers
+        let shift_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::RELEASE);
+        let _ = device_remapper.process(shift_release);
+        let ctrl_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::RELEASE);
+        let _ = device_remapper.process(ctrl_release);
+
+        // ============================================================
+        // Step 3: Verify gaming profile is now active (A -> C)
+        // ============================================================
+        assert_eq!(device_remapper.active_profile(), "gaming");
+
+        let a_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), event_value::PRESS);
+        let result = device_remapper.process(a_press);
+        let events = expect_events(result);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_C.code(), "A should be remapped to C in gaming profile");
+
+        // Release A
+        let a_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), event_value::RELEASE);
+        let _ = device_remapper.process(a_release);
+
+        // ============================================================
+        // Step 4: Press Ctrl+Shift+1 to switch back to default profile
+        // ============================================================
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::PRESS);
+        let _ = device_remapper.process(shift_press);
+
+        let key_1_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_1.code(), event_value::PRESS);
+        let result = device_remapper.process(key_1_press);
+
+        // Handle the profile switch
+        match result {
+            RemapResult::ProfileSwitch(profile_name) => {
+                assert_eq!(profile_name, "default");
+                device_remapper.switch_profile(&profile_name).unwrap();
+            }
+            other => panic!("Expected ProfileSwitch for Ctrl+Shift+1, got {:?}", other),
+        }
+
+        // Release modifiers
+        let shift_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::RELEASE);
+        let _ = device_remapper.process(shift_release);
+        let ctrl_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::RELEASE);
+        let _ = device_remapper.process(ctrl_release);
+
+        // ============================================================
+        // Step 5: Verify default profile is active again (A -> B)
+        // ============================================================
+        assert_eq!(device_remapper.active_profile(), "default");
+
+        let a_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), event_value::PRESS);
+        let result = device_remapper.process(a_press);
+        let events = expect_events(result);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].code(), Key::KEY_B.code(), "A should be remapped to B after switching back to default");
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_does_not_emit_key_events() {
+        // Task 030-3.7.1: Verify that pressing a profile switch keybind
+        // does NOT emit the trigger key's events (the keybind is "consumed")
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+G".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Press Ctrl+Shift+G
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::PRESS);
+        let _ = device_remapper.process(shift_press);
+
+        let g_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_G.code(), event_value::PRESS);
+        let result = device_remapper.process(g_press);
+
+        // The result should be ProfileSwitch, NOT Events containing 'G'
+        match result {
+            RemapResult::ProfileSwitch(profile_name) => {
+                assert_eq!(profile_name, "gaming");
+                // The keybind is consumed - no G key event should be emitted
+            }
+            RemapResult::Events(events) => {
+                panic!(
+                    "Profile switch keybind should NOT produce Events, got {} events: {:?}",
+                    events.len(),
+                    events.iter().map(|e| Key::new(e.code())).collect::<Vec<_>>()
+                );
+            }
+            RemapResult::Macro(_) => {
+                panic!("Profile switch keybind should NOT produce Macro");
+            }
+        }
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_without_modifiers_held_does_not_trigger() {
+        // Task 030-3.7.1: Verify that pressing the trigger key without
+        // the required modifiers does NOT trigger a profile switch
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Press just '2' without Ctrl+Shift - should NOT trigger profile switch
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+
+        // Should be Events (passthrough), not ProfileSwitch
+        match result {
+            RemapResult::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].code(), Key::KEY_2.code(), "Key 2 should pass through");
+            }
+            RemapResult::ProfileSwitch(name) => {
+                panic!("Should NOT trigger ProfileSwitch without modifiers, got '{}'", name);
+            }
+            RemapResult::Macro(_) => {
+                panic!("Should NOT trigger Macro");
+            }
+        }
+
+        // Verify profile hasn't changed
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_with_partial_modifiers_does_not_trigger() {
+        // Task 030-3.7.1: Verify that pressing the trigger key with only
+        // SOME of the required modifiers does NOT trigger a profile switch
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Press Ctrl+2 (missing Shift) - should NOT trigger profile switch
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+
+        // Should be Events (passthrough), not ProfileSwitch
+        match result {
+            RemapResult::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].code(), Key::KEY_2.code(), "Key 2 should pass through");
+            }
+            RemapResult::ProfileSwitch(name) => {
+                panic!("Should NOT trigger ProfileSwitch with partial modifiers (Ctrl only), got '{}'", name);
+            }
+            RemapResult::Macro(_) => {
+                panic!("Should NOT trigger Macro");
+            }
+        }
+
+        // Verify profile hasn't changed
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_with_extra_modifiers_does_not_trigger() {
+        // Task 030-3.7.1: Verify that pressing the trigger key with EXTRA
+        // modifiers beyond what's required does NOT trigger a profile switch
+        // (exact match required)
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Press Ctrl+Shift+2 (extra Shift) when keybind is just Ctrl+2
+        // Should NOT trigger profile switch due to extra modifier
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::PRESS);
+        let _ = device_remapper.process(shift_press);
+
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+
+        // Should be Events (passthrough), not ProfileSwitch
+        match result {
+            RemapResult::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].code(), Key::KEY_2.code(), "Key 2 should pass through");
+            }
+            RemapResult::ProfileSwitch(name) => {
+                panic!("Should NOT trigger ProfileSwitch with extra modifiers (Ctrl+Shift vs Ctrl), got '{}'", name);
+            }
+            RemapResult::Macro(_) => {
+                panic!("Should NOT trigger Macro");
+            }
+        }
+
+        // Verify profile hasn't changed
+        assert_eq!(device_remapper.active_profile(), "default");
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_only_triggers_on_press() {
+        // Task 030-3.7.1: Verify that profile switch keybinds only trigger
+        // on key press (value=1), not on release or repeat
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+Shift+2".to_string(), "gaming".to_string());
+
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        // Press Ctrl+Shift, then test key release
+        let ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(ctrl_press);
+
+        let shift_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_LEFTSHIFT.code(), event_value::PRESS);
+        let _ = device_remapper.process(shift_press);
+
+        // Test release event (value=0) - should NOT trigger
+        let key_2_release = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::RELEASE);
+        let result = device_remapper.process(key_2_release);
+        assert!(matches!(result, RemapResult::Events(_)), "Release should not trigger profile switch");
+
+        // Test repeat event (value=2) - should NOT trigger
+        let key_2_repeat = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), 2); // repeat
+        let result = device_remapper.process(key_2_repeat);
+        assert!(matches!(result, RemapResult::Events(_)), "Repeat should not trigger profile switch");
+
+        // Verify profile hasn't changed
+        assert_eq!(device_remapper.active_profile(), "default");
+
+        // Now test press event (value=1) - SHOULD trigger
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+        assert!(matches!(result, RemapResult::ProfileSwitch(name) if name == "gaming"),
+            "Press should trigger profile switch");
+    }
+
+    #[test]
+    fn test_profile_switch_keybind_left_right_modifier_equivalence() {
+        // Task 030-3.7.1: Verify that left and right modifier variants
+        // are treated equivalently for profile switch keybinds
+        // (Keybind "Ctrl+2" should trigger with either LeftCtrl or RightCtrl)
+        let mut profiles = HashMap::new();
+        profiles.insert("default".to_string(), Profile::default());
+        profiles.insert("gaming".to_string(), Profile::default());
+
+        let mut profile_switch = HashMap::new();
+        profile_switch.insert("Ctrl+2".to_string(), "gaming".to_string());
+
+        // Test with RightCtrl instead of LeftCtrl
+        let mut device_remapper = DeviceRemapper::new_with_profile_switch(
+            "Test Keyboard".to_string(),
+            profiles,
+            "default",
+            profile_switch,
+        ).unwrap();
+
+        let right_ctrl_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_RIGHTCTRL.code(), event_value::PRESS);
+        let _ = device_remapper.process(right_ctrl_press);
+
+        let key_2_press = InputEvent::new(evdev::EventType::KEY, Key::KEY_2.code(), event_value::PRESS);
+        let result = device_remapper.process(key_2_press);
+
+        match result {
+            RemapResult::ProfileSwitch(name) => {
+                assert_eq!(name, "gaming", "RightCtrl should be equivalent to Ctrl modifier");
+            }
+            other => panic!("Expected ProfileSwitch with RightCtrl, got {:?}", other),
+        }
     }
 }

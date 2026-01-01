@@ -66,6 +66,57 @@ enum Commands {
     /// If configuration parsing fails, the daemon keeps running with the
     /// previous configuration. Fix the config and reload again.
     Reload,
+
+    /// Manage device profiles
+    ///
+    /// Switch between named profiles for a device or list available profiles.
+    ///
+    /// Examples:
+    ///   niri-mapper profile "Keychron K3 Pro" gaming
+    ///   niri-mapper profile --list "Keychron K3 Pro"
+    Profile {
+        /// List available profiles instead of switching
+        #[arg(long, short)]
+        list: bool,
+
+        /// Name of the device (as configured in config.kdl)
+        device_name: String,
+
+        /// Name of the profile to switch to (required unless --list is specified)
+        profile_name: Option<String>,
+    },
+
+    /// Switch a device to a specific profile
+    ///
+    /// This command sends a profile switch request to the running daemon via
+    /// the control socket. The daemon must be running for this command to work.
+    ///
+    /// Examples:
+    ///   niri-mapper switch-profile "Keychron K3 Pro" gaming
+    ///   niri-mapper switch-profile "My Keyboard" default
+    #[command(name = "switch-profile")]
+    SwitchProfile {
+        /// Name of the device (as configured in config.kdl)
+        device: String,
+
+        /// Name of the profile to switch to
+        profile: String,
+    },
+
+    /// Query niri compositor state
+    ///
+    /// Connects to the niri IPC socket and queries the current focused window
+    /// and workspace information. Requires niri to be running.
+    ///
+    /// Examples:
+    ///   niri-mapper niri-status
+    ///   niri-mapper niri-status --json
+    #[command(name = "niri-status")]
+    NiriStatus {
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> miette::Result<()> {
@@ -90,6 +141,27 @@ fn main() -> miette::Result<()> {
         Commands::Start => cmd_start(),
         Commands::Stop => cmd_stop(),
         Commands::Reload => cmd_reload(),
+        Commands::Profile {
+            list,
+            device_name,
+            profile_name,
+        } => {
+            if list {
+                cmd_profile_list(&device_name)
+            } else {
+                match profile_name {
+                    Some(profile) => cmd_profile_switch(&device_name, &profile),
+                    None => {
+                        eprintln!("Error: profile name required when not using --list");
+                        eprintln!("Usage: niri-mapper profile <device-name> <profile-name>");
+                        eprintln!("       niri-mapper profile --list <device-name>");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Commands::SwitchProfile { device, profile } => cmd_switch_profile(&device, &profile),
+        Commands::NiriStatus { json } => cmd_niri_status(json),
     }
 }
 
@@ -578,6 +650,539 @@ fn cmd_reload() -> miette::Result<()> {
     }
     println!("\nIs the service running? Check with:");
     println!("  niri-mapper status");
+
+    Ok(())
+}
+
+/// Switch the active profile for a device.
+///
+/// Sends a profile switch request to the daemon via IPC (Unix socket).
+///
+/// # Arguments
+/// * `device_name` - Name of the device as configured in config.kdl
+/// * `profile_name` - Name of the profile to switch to
+fn cmd_profile_switch(device_name: &str, profile_name: &str) -> miette::Result<()> {
+    use serde::{Deserialize, Serialize};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // IPC request message format (matches daemon's IpcRequest)
+    #[derive(Serialize)]
+    struct ProfileSwitchRequest<'a> {
+        #[serde(rename = "type")]
+        msg_type: &'static str,
+        device: &'a str,
+        profile: &'a str,
+    }
+
+    // IPC response message format (matches daemon's IpcResponse)
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum IpcResponse {
+        Success {
+            #[serde(default)]
+            message: Option<String>,
+        },
+        Error {
+            message: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    // Determine socket path
+    let socket_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(runtime_dir).join("niri-mapper.sock")
+    } else {
+        let uid = unsafe { nix::libc::getuid() };
+        std::path::PathBuf::from(format!("/tmp/niri-mapper-{}.sock", uid))
+    };
+
+    // Connect to the daemon
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            miette::miette!(
+                "Cannot connect to niri-mapper daemon.\n\
+                 Is the daemon running? Check with: niri-mapper status"
+            )
+        } else {
+            miette::miette!("Failed to connect to daemon: {}", e)
+        }
+    })?;
+
+    // Build and send the request
+    let request = ProfileSwitchRequest {
+        msg_type: "profile_switch",
+        device: device_name,
+        profile: profile_name,
+    };
+
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| miette::miette!("Failed to serialize request: {}", e))?;
+
+    writeln!(stream, "{}", request_json)
+        .map_err(|e| miette::miette!("Failed to send request to daemon: {}", e))?;
+
+    stream
+        .flush()
+        .map_err(|e| miette::miette!("Failed to flush request: {}", e))?;
+
+    // Read the response
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| miette::miette!("Failed to read response from daemon: {}", e))?;
+
+    // Parse and display the response
+    let response: IpcResponse = serde_json::from_str(response_line.trim())
+        .map_err(|e| miette::miette!("Failed to parse daemon response: {}", e))?;
+
+    match response {
+        IpcResponse::Success { message } => {
+            println!(
+                "Switched device '{}' to profile '{}'.",
+                device_name, profile_name
+            );
+            if let Some(msg) = message {
+                println!("{}", msg);
+            }
+            Ok(())
+        }
+        IpcResponse::Error { message } => {
+            Err(miette::miette!("Profile switch failed: {}", message))
+        }
+        IpcResponse::Unknown => {
+            Err(miette::miette!("Unexpected response from daemon"))
+        }
+    }
+}
+
+/// List available profiles for a device.
+///
+/// Queries the daemon via IPC to get the list of profiles and which one is active.
+///
+/// # Arguments
+/// * `device_name` - Name of the device as configured in config.kdl
+fn cmd_profile_list(device_name: &str) -> miette::Result<()> {
+    use serde::{Deserialize, Serialize};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // IPC request message format (matches daemon's IpcRequest)
+    #[derive(Serialize)]
+    struct ProfileListRequest<'a> {
+        #[serde(rename = "type")]
+        msg_type: &'static str,
+        device: &'a str,
+    }
+
+    // IPC response message format (matches daemon's IpcResponse)
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum IpcResponse {
+        ProfileList {
+            profiles: Vec<String>,
+            active: String,
+        },
+        Error {
+            message: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    // Determine socket path
+    let socket_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(runtime_dir).join("niri-mapper.sock")
+    } else {
+        let uid = unsafe { nix::libc::getuid() };
+        std::path::PathBuf::from(format!("/tmp/niri-mapper-{}.sock", uid))
+    };
+
+    // Connect to the daemon
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            miette::miette!(
+                "Cannot connect to niri-mapper daemon.\n\
+                 Is the daemon running? Check with: niri-mapper status"
+            )
+        } else {
+            miette::miette!("Failed to connect to daemon: {}", e)
+        }
+    })?;
+
+    // Build and send the request
+    let request = ProfileListRequest {
+        msg_type: "profile_list",
+        device: device_name,
+    };
+
+    let request_json =
+        serde_json::to_string(&request).map_err(|e| miette::miette!("Failed to serialize request: {}", e))?;
+
+    writeln!(stream, "{}", request_json)
+        .map_err(|e| miette::miette!("Failed to send request to daemon: {}", e))?;
+
+    stream
+        .flush()
+        .map_err(|e| miette::miette!("Failed to flush request: {}", e))?;
+
+    // Read the response
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| miette::miette!("Failed to read response from daemon: {}", e))?;
+
+    // Parse and display the response
+    let response: IpcResponse = serde_json::from_str(response_line.trim())
+        .map_err(|e| miette::miette!("Failed to parse daemon response: {}", e))?;
+
+    match response {
+        IpcResponse::ProfileList { profiles, active } => {
+            println!("Profiles for device '{}':", device_name);
+            for profile in &profiles {
+                if profile == &active {
+                    println!("  * {} [active]", profile);
+                } else {
+                    println!("    {}", profile);
+                }
+            }
+            Ok(())
+        }
+        IpcResponse::Error { message } => {
+            Err(miette::miette!("Failed to list profiles: {}", message))
+        }
+        IpcResponse::Unknown => {
+            Err(miette::miette!("Unexpected response from daemon"))
+        }
+    }
+}
+
+/// Switch a device to a specific profile using the control socket.
+///
+/// This function uses the control socket format from `control.rs`:
+/// - Command: `{"switch_profile": {"device": "...", "profile": "..."}}`
+/// - Response: `{"success": {...}}` or `{"error": {"message": "..."}}`
+///
+/// The socket path is determined by `get_socket_path()` logic:
+/// - `$XDG_RUNTIME_DIR/niri-mapper.sock` if XDG_RUNTIME_DIR is set
+/// - `/tmp/niri-mapper-$UID.sock` otherwise
+///
+/// # Arguments
+/// * `device` - Name of the device as configured in config.kdl
+/// * `profile` - Name of the profile to switch to
+fn cmd_switch_profile(device: &str, profile: &str) -> miette::Result<()> {
+    use serde::{Deserialize, Serialize};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    // ControlCommand format from control.rs: {"switch_profile": {"device": "...", "profile": "..."}}
+    #[derive(Serialize)]
+    struct SwitchProfileArgs<'a> {
+        device: &'a str,
+        profile: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct ControlCommand<'a> {
+        switch_profile: SwitchProfileArgs<'a>,
+    }
+
+    // ControlResponse format from control.rs
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ControlResponse {
+        Success {
+            #[serde(default)]
+            message: Option<String>,
+        },
+        Error {
+            message: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    // Get socket path (mirrors get_socket_path() from control.rs)
+    let socket_path = if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        std::path::PathBuf::from(runtime_dir).join("niri-mapper.sock")
+    } else {
+        let uid = unsafe { nix::libc::getuid() };
+        std::path::PathBuf::from(format!("/tmp/niri-mapper-{}.sock", uid))
+    };
+
+    // Connect to the daemon control socket
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound
+            || e.kind() == std::io::ErrorKind::ConnectionRefused
+        {
+            miette::miette!(
+                "Cannot connect to niri-mapper daemon at {}.\n\
+                 Is the daemon running? Check with: niri-mapper status",
+                socket_path.display()
+            )
+        } else {
+            miette::miette!("Failed to connect to daemon: {}", e)
+        }
+    })?;
+
+    // Build and send the control command
+    let command = ControlCommand {
+        switch_profile: SwitchProfileArgs { device, profile },
+    };
+
+    let command_json = serde_json::to_string(&command)
+        .map_err(|e| miette::miette!("Failed to serialize command: {}", e))?;
+
+    writeln!(stream, "{}", command_json)
+        .map_err(|e| miette::miette!("Failed to send command to daemon: {}", e))?;
+
+    stream
+        .flush()
+        .map_err(|e| miette::miette!("Failed to flush command: {}", e))?;
+
+    // Read the response
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| miette::miette!("Failed to read response from daemon: {}", e))?;
+
+    // Parse and display the response
+    let response: ControlResponse = serde_json::from_str(response_line.trim())
+        .map_err(|e| miette::miette!("Failed to parse daemon response: {}", e))?;
+
+    match response {
+        ControlResponse::Success { message } => {
+            println!(
+                "Switched device '{}' to profile '{}'.",
+                device, profile
+            );
+            if let Some(msg) = message {
+                println!("{}", msg);
+            }
+            Ok(())
+        }
+        ControlResponse::Error { message } => {
+            Err(miette::miette!("Profile switch failed: {}", message))
+        }
+        ControlResponse::Unknown => {
+            Err(miette::miette!("Unexpected response from daemon"))
+        }
+    }
+}
+
+/// Query niri compositor state (focused window and workspaces).
+///
+/// Connects to the niri IPC socket and queries current state.
+/// Requires niri to be running.
+///
+/// # Arguments
+/// * `json_output` - If true, output as JSON; otherwise, formatted text
+fn cmd_niri_status(json_output: bool) -> miette::Result<()> {
+    use serde::Serialize;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+
+    // Environment variable name for the niri socket path
+    const NIRI_SOCKET_ENV: &str = "NIRI_SOCKET";
+
+    // Discover the niri IPC socket path from the environment
+    let socket_path_str = std::env::var(NIRI_SOCKET_ENV).map_err(|_| {
+        miette::miette!(
+            "NIRI_SOCKET environment variable not set.\n\
+             Is niri running? niri-mapper needs to be run from within a niri session."
+        )
+    })?;
+
+    let socket_path = PathBuf::from(&socket_path_str);
+
+    // Validate the path exists
+    if !socket_path.exists() {
+        return Err(miette::miette!(
+            "Niri socket not found at {}.\n\
+             Is niri running?",
+            socket_path.display()
+        ));
+    }
+
+    // Connect to niri IPC socket
+    let mut stream = UnixStream::connect(&socket_path).map_err(|e| {
+        miette::miette!(
+            "Failed to connect to niri socket at {}: {}\n\
+             Is niri running?",
+            socket_path.display(),
+            e
+        )
+    })?;
+
+    // Helper function to send a request and read the response
+    fn send_request(
+        stream: &mut UnixStream,
+        request: &niri_ipc::Request,
+    ) -> miette::Result<niri_ipc::Response> {
+        // Serialize the request to JSON
+        let request_json = serde_json::to_string(request)
+            .map_err(|e| miette::miette!("Failed to serialize request: {}", e))?;
+
+        // Write the request to the socket with a newline
+        writeln!(stream, "{}", request_json)
+            .map_err(|e| miette::miette!("Failed to send request to niri: {}", e))?;
+
+        stream
+            .flush()
+            .map_err(|e| miette::miette!("Failed to flush request: {}", e))?;
+
+        // Read the response line
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .map_err(|e| miette::miette!("Failed to read response from niri: {}", e))?;
+
+        if response_line.is_empty() {
+            return Err(miette::miette!("Connection to niri closed unexpectedly"));
+        }
+
+        // Deserialize the reply (Result<Response, String>)
+        let reply: niri_ipc::Reply = serde_json::from_str(&response_line)
+            .map_err(|e| miette::miette!("Failed to parse niri response: {}", e))?;
+
+        // Extract the response or convert the error
+        reply.map_err(|message| miette::miette!("Niri returned error: {}", message))
+    }
+
+    // Query focused window
+    let focused_window_response = send_request(&mut stream, &niri_ipc::Request::FocusedWindow)?;
+    let focused_window = match focused_window_response {
+        niri_ipc::Response::FocusedWindow(window) => window,
+        _ => {
+            return Err(miette::miette!(
+                "Unexpected response to FocusedWindow request"
+            ))
+        }
+    };
+
+    // We need a new connection for each request since niri expects one request per connection
+    let mut stream2 = UnixStream::connect(&socket_path).map_err(|e| {
+        miette::miette!(
+            "Failed to connect to niri socket for workspaces query: {}",
+            e
+        )
+    })?;
+
+    // Query workspaces
+    let workspaces_response = send_request(&mut stream2, &niri_ipc::Request::Workspaces)?;
+    let workspaces = match workspaces_response {
+        niri_ipc::Response::Workspaces(ws) => ws,
+        _ => return Err(miette::miette!("Unexpected response to Workspaces request")),
+    };
+
+    // Build output structure
+    #[derive(Serialize)]
+    struct NiriStatusOutput {
+        focused_window: Option<FocusedWindowInfo>,
+        workspaces: Vec<WorkspaceInfo>,
+    }
+
+    #[derive(Serialize)]
+    struct FocusedWindowInfo {
+        id: u64,
+        app_id: Option<String>,
+        title: Option<String>,
+    }
+
+    #[derive(Serialize)]
+    struct WorkspaceInfo {
+        id: u64,
+        idx: u8,
+        name: Option<String>,
+        output: Option<String>,
+        is_active: bool,
+        is_focused: bool,
+    }
+
+    let output = NiriStatusOutput {
+        focused_window: focused_window.map(|w| FocusedWindowInfo {
+            id: w.id,
+            app_id: w.app_id,
+            title: w.title,
+        }),
+        workspaces: workspaces
+            .into_iter()
+            .map(|ws| WorkspaceInfo {
+                id: ws.id,
+                idx: ws.idx,
+                name: ws.name,
+                output: ws.output,
+                is_active: ws.is_active,
+                is_focused: ws.is_focused,
+            })
+            .collect(),
+    };
+
+    if json_output {
+        // Output as JSON
+        let json = serde_json::to_string_pretty(&output)
+            .map_err(|e| miette::miette!("Failed to serialize output: {}", e))?;
+        println!("{}", json);
+    } else {
+        // Output as formatted text
+        println!("Niri Status");
+        println!("===========");
+        println!();
+
+        // Focused window
+        println!("Focused Window:");
+        match &output.focused_window {
+            Some(window) => {
+                println!(
+                    "  App ID: {}",
+                    window.app_id.as_deref().unwrap_or("<none>")
+                );
+                println!("  Title:  {}", window.title.as_deref().unwrap_or("<none>"));
+                println!("  ID:     {}", window.id);
+            }
+            None => {
+                println!("  <no window focused>");
+            }
+        }
+
+        println!();
+
+        // Workspaces
+        println!("Workspaces:");
+        for ws in &output.workspaces {
+            let name_str = ws
+                .name
+                .as_ref()
+                .map(|n| format!(" \"{}\"", n))
+                .unwrap_or_default();
+            let output_str = ws
+                .output
+                .as_ref()
+                .map(|o| format!(" on {}", o))
+                .unwrap_or_default();
+            let status = if ws.is_focused {
+                " [focused]"
+            } else if ws.is_active {
+                " [active]"
+            } else {
+                ""
+            };
+            println!(
+                "  #{}{}{}{} (id: {})",
+                ws.idx, name_str, output_str, status, ws.id
+            );
+        }
+    }
 
     Ok(())
 }

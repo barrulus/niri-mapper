@@ -325,6 +325,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
                 DeviceConfig {
                     name: Some("Keyboard2".to_string()),
@@ -341,6 +342,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
             ],
         };
@@ -369,6 +371,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
                 DeviceConfig {
                     name: Some("Keyboard2".to_string()),
@@ -385,6 +388,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
             ],
         };
@@ -459,6 +463,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 
@@ -508,6 +513,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
                 DeviceConfig {
                     name: Some("Device2".to_string()),
@@ -524,6 +530,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
             ],
         };
@@ -559,6 +566,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 
@@ -596,6 +604,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 
@@ -642,6 +651,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 
@@ -698,6 +708,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
                 DeviceConfig {
                     name: Some("Keyboard2".to_string()),
@@ -714,6 +725,7 @@ mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    profile_switch: HashMap::new(),
                 },
             ],
         };
@@ -820,6 +832,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 
@@ -854,6 +867,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                profile_switch: HashMap::new(),
             }],
         };
 

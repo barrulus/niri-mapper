@@ -111,6 +111,57 @@ In your Home Manager configuration:
 
 **Note**: For Home Manager, you must ensure your user is in the `input` group separately (either via NixOS configuration or manually).
 
+## Manual Installation (non-NixOS)
+
+For Arch, Fedora, Ubuntu, and other distributions:
+
+### 1. Build and install
+
+```bash
+cargo build --release
+sudo cp target/release/niri-mapper /usr/bin/
+sudo cp target/release/niri-mapperd /usr/bin/
+```
+
+### 2. Add user to input group
+
+```bash
+sudo usermod -aG input $USER
+# Log out and back in for group change to take effect
+```
+
+### 3. Create configuration
+
+```bash
+mkdir -p ~/.config/niri-mapper
+cat > ~/.config/niri-mapper/config.kdl << 'EOF'
+device "Your Keyboard Name" {
+    profile "default" {
+        remap {
+            CapsLock "Escape"
+        }
+    }
+}
+EOF
+```
+
+Run `niri-mapper devices` to find your keyboard's exact name.
+
+### 4. Install and enable systemd service
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/niri-mapper.user.service ~/.config/systemd/user/niri-mapper.service
+systemctl --user daemon-reload
+systemctl --user enable --now niri-mapper
+```
+
+### 5. Verify
+
+```bash
+systemctl --user status niri-mapper
+```
+
 ## Common Remapping Examples
 
 ### Swap CapsLock and Escape
@@ -164,6 +215,83 @@ niri-mapper start
 niri-mapper stop
 niri-mapper status
 ```
+
+## Manual Testing
+
+Follow this procedure to verify the daemon is working correctly:
+
+### 1. Create a Test Configuration
+
+Create `~/.config/niri-mapper/config.kdl`:
+
+```kdl
+device "Your Keyboard Name" {
+    profile "default" {
+        remap {
+            CapsLock "Escape"
+        }
+    }
+}
+```
+
+Replace `"Your Keyboard Name"` with your actual keyboard name from `niri-mapper devices`.
+
+### 2. Start the Daemon
+
+```bash
+# Start in foreground for testing (logs visible in terminal)
+niri-mapperd --config ~/.config/niri-mapper/config.kdl --foreground
+```
+
+Or via systemd:
+
+```bash
+systemctl --user start niri-mapper
+```
+
+### 3. Verify Device Grab
+
+Check that the daemon grabbed your keyboard:
+
+```bash
+# Check service logs
+journalctl --user -u niri-mapper -f
+
+# Or check dmesg for uinput device creation
+sudo dmesg | tail -20
+```
+
+You should see messages like:
+- `Matched device 'Your Keyboard Name' at /dev/input/eventX`
+- `Grabbed device: Your Keyboard Name`
+
+### 4. Test Key Remapping
+
+1. Open a text editor or terminal
+2. Press CapsLock - it should produce Escape (close dialogs, etc.)
+3. Verify CapsLock LED does NOT toggle (the key is being remapped)
+
+### 5. Verify Graceful Shutdown
+
+Stop the daemon and verify the device is released:
+
+```bash
+# Stop the daemon
+systemctl --user stop niri-mapper
+
+# Or if running in foreground, press Ctrl+C
+```
+
+Check logs for clean shutdown:
+```bash
+journalctl --user -u niri-mapper | tail -10
+```
+
+You should see:
+- `Received shutdown signal`
+- `Released device: Your Keyboard Name`
+
+After stopping, your physical keyboard should work normally again without remapping.
 
 ## Troubleshooting
 

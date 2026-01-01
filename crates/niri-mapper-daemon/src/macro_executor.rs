@@ -202,20 +202,34 @@ impl MacroExecutor {
 mod tests {
     use super::*;
 
-    /// Helper to create a MacroExecutor for testing parse_key_combo
-    fn create_test_executor() -> MacroExecutor {
+    /// Helper to create a MacroExecutor for testing parse_key_combo.
+    /// Returns None if /dev/uinput is not available (e.g., in Nix sandbox).
+    fn create_test_executor() -> Option<MacroExecutor> {
         // We need a virtual device for the executor, but we won't use it for parsing tests
         // Create a minimal mock by using an Arc<Mutex<VirtualDevice>>
         // Note: This test only tests parse_key_combo, not actual key injection
-        let vd = Arc::new(Mutex::new(
-            VirtualDevice::new_keyboard("test-macro-executor").expect("Failed to create test device"),
-        ));
-        MacroExecutor::new(vd)
+        match VirtualDevice::new_keyboard("test-macro-executor") {
+            Ok(vd) => Some(MacroExecutor::new(Arc::new(Mutex::new(vd)))),
+            Err(_) => None, // /dev/uinput not available (sandbox, no permissions, etc.)
+        }
+    }
+
+    /// Helper macro to skip tests when virtual device creation fails
+    macro_rules! require_executor {
+        () => {
+            match create_test_executor() {
+                Some(e) => e,
+                None => {
+                    eprintln!("Skipping test: /dev/uinput not available");
+                    return;
+                }
+            }
+        };
     }
 
     #[test]
     fn test_simple_key_no_modifiers() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Simple letter key
         let (modifiers, key) = executor.parse_key_combo("A").unwrap();
@@ -245,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_single_modifier_combo() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Ctrl+C
         let (modifiers, key) = executor.parse_key_combo("Ctrl+C").unwrap();
@@ -274,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_multiple_modifiers_combo() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Ctrl+Shift+V (the example from the task requirements)
         let (modifiers, key) = executor.parse_key_combo("Ctrl+Shift+V").unwrap();
@@ -300,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_modifier_aliases() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Control is an alias for Ctrl
         let (modifiers, key) = executor.parse_key_combo("Control+C").unwrap();
@@ -320,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitivity() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Modifiers should be case-insensitive
         let (modifiers, _) = executor.parse_key_combo("ctrl+a").unwrap();
@@ -335,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_whitespace_handling() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Should handle spaces around +
         let (modifiers, key) = executor.parse_key_combo("Ctrl + C").unwrap();
@@ -345,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_modifier_as_main_key() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // A modifier alone should work as the main key
         let (modifiers, key) = executor.parse_key_combo("Ctrl").unwrap();
@@ -359,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_unknown_key_error() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Unknown key should return an error
         let result = executor.parse_key_combo("UnknownKey");
@@ -373,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_modifiers_map_to_left_variants() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Verify all modifiers map to their Left variants as specified in requirements
         let (modifiers, _) = executor.parse_key_combo("Ctrl+A").unwrap();
@@ -410,7 +424,7 @@ mod tests {
     /// A press -> A release -> B press -> B release -> C press -> C release
     #[test]
     fn test_simple_key_sequence_parsing() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Test that each key in the sequence parses correctly
         // Macro: ["A", "B", "C"]
@@ -484,7 +498,7 @@ mod tests {
         // - tap_key(KEY_C) -> press C, release C
 
         // Verify parsing produces the expected keys
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         let (mods_a, key_a) = executor.parse_key_combo("A").unwrap();
         let (mods_b, key_b) = executor.parse_key_combo("B").unwrap();
@@ -536,7 +550,7 @@ mod tests {
     /// to the correct modifiers and main key.
     #[test]
     fn test_combo_key_sequence_parsing() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Test Ctrl+C parsing
         let (modifiers, key) = executor.parse_key_combo("Ctrl+C").unwrap();
@@ -604,7 +618,7 @@ mod tests {
         // 3. Tap main key: tap_key(KEY_C) -> [CPress, SYN, CRelease, SYN]
         // 4. Release all modifiers in reverse: release_key(KEY_LEFTCTRL) -> [CtrlRelease, SYN]
 
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Parse Ctrl+C
         let (mods_c, key_c) = executor.parse_key_combo("Ctrl+C").unwrap();
@@ -657,7 +671,7 @@ mod tests {
     /// correctly press modifiers in order and release them in reverse order.
     #[test]
     fn test_multi_modifier_combo_event_sequence() {
-        let executor = create_test_executor();
+        let executor = require_executor!();
 
         // Parse Ctrl+Shift+V
         let (modifiers, key) = executor.parse_key_combo("Ctrl+Shift+V").unwrap();

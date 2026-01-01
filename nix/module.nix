@@ -394,9 +394,11 @@ in
         Restart = "on-failure";
         RestartSec = 5;
 
-        # Security hardening - general restrictions
+        # Security hardening - relaxed for input device access
+        # evdev requires direct device access and various ioctls that
+        # aggressive sandboxing can break
         PrivateTmp = true;
-        ProtectSystem = "strict";
+        ProtectSystem = "full";  # Less strict than "strict"
         ProtectHome = "read-only";
         # Allow writing to the niri keybinds output directory
         ReadWritePaths = [ (builtins.dirOf cfg.settings.global.niriKeybindsPath) ];
@@ -408,35 +410,14 @@ in
         ProtectHostname = true;
         RestrictRealtime = true;
         RestrictSUIDSGID = true;
-        RestrictNamespaces = true;
         LockPersonality = true;
-        MemoryDenyWriteExecute = true;
         RemoveIPC = true;
-        PrivateUsers = false;  # Needs access to real user for device permissions
 
         # Must be false - we need to access /dev/input/* and /dev/uinput
         PrivateDevices = false;
 
-        # Device access control - only allow input devices and uinput
-        DevicePolicy = "closed";
-        DeviceAllow = [
-          "/dev/input/* rw"
-          "/dev/uinput rw"
-        ];
-
-        # Capability restrictions - minimal set for input device access
-        # CAP_DAC_READ_SEARCH: May be needed for reading device paths
-        # Note: Most access is handled via input group membership, not capabilities
-        CapabilityBoundingSet = [ "CAP_DAC_READ_SEARCH" ];
-        AmbientCapabilities = [ ];
-
-        # System call filtering - allow only needed syscalls
-        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
-        SystemCallArchitectures = "native";
-        SystemCallErrorNumber = "EPERM";
-
-        # No new privileges (safe since we use group-based device access)
-        NoNewPrivileges = true;
+        # Don't restrict devices - evdev needs full access to input devices
+        # DevicePolicy = "auto" is the default, allows device access
 
         # Required for input device access via group membership
         SupplementaryGroups = [ "input" ];
